@@ -512,14 +512,32 @@ def build_lighting(sections: list[Section], theme: dict, tpb: int,
     return out
 
 
+# Keyframe cadence (in BEATS between [next]) by section energy — mirrors the Magma
+# themes' per-section `keyframe_rate`. The section's light already pulses at the
+# energy-driven _LIGHT_CADENCE; these keyframes animate the MANUAL presets that
+# persist, so we DENSIFY high-energy parts (½ beat) rather than starve calm ones —
+# choruses pulse faster, calm verses stay gentle, none go silent. Floored at 1/4 beat.
+_KEYFRAME_RATE = {"high": 0.5, "mid": 1.0, "calm": 2.0}
+
+
+def _energy_for_tick(sections: list["Section"], tick: int) -> str:
+    """Effective energy of the section containing `tick` (defaults to 'calm')."""
+    for s in sections:
+        if s.start <= tick < s.end:
+            return section_energy(s)
+    return "calm"
+
+
 def _build_light_keyframes(light_events: list[tuple[int, str]],
                            sections: list["Section"], tpb: int,
                            drums: list[int],
                            pause_spans: list[tuple[int, int]],
                            strobe_spans: list[tuple[int, int]]) -> list[AbsEvent]:
-    """Generate the `[next]` that make the MANUAL presets advance, 1× per beat (snap to
-    the nearest hit ±1/4 beat), from the preset's tick to the next light change. Does
-    not keyframe inside pauses/strobe nor auto presets. Pattern of the official venues."""
+    """Generate the `[next]` that make the MANUAL presets advance (snap to the nearest
+    hit ±1/4 beat), from the preset's tick to the next light change. The cadence now
+    follows the section energy (`_KEYFRAME_RATE`): 1 beat in high-energy sections,
+    every 2 in mid, every 4 in calm — instead of a flat 1×/beat everywhere. Does not
+    keyframe inside pauses/strobe nor auto presets. Pattern of the official venues."""
     if not light_events:
         return []
     song_end = sections[-1].end if sections else 0
@@ -529,14 +547,16 @@ def _build_light_keyframes(light_events: list[tuple[int, str]],
         if name not in LIGHTING_MANUAL:
             continue
         nxt = le[idx + 1][0] if idx + 1 < len(le) else song_end
-        b = tick + tpb
+        step = max(tpb // 4, int(tpb * _KEYFRAME_RATE.get(
+            _energy_for_tick(sections, tick), 1.0)))
+        b = tick + step
         while b < nxt:
             if not _in_span(b, pause_spans) and not _in_span(b, strobe_spans):
                 kk = _nearest(b, drums, tpb // 4, floor=tick + 1) if drums else None
                 kk = kk if kk is not None else b
                 if tick < kk < nxt:
                     out.append(_txt(kk, "[next]"))
-            b += tpb
+            b += step
     return out
 
 

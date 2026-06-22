@@ -294,12 +294,28 @@ def _ms_to_tick(ms: float, tempo_map, tpb: int) -> int:
     return int(prev_t + (ms - acc_ms) * 1000.0 / prev_u * tpb)
 
 
-def section_energy_tiers(paths, sections, tempo_map, tpb: int,
-                         hop_s: float = 0.1) -> list[str] | None:
-    """Loudness tier ('calm'/'mid'/'high') per section, via thirds of the mean RMS.
-    `paths` may be a single path or a list of stems (summed into the mix).
-    Returns None if the audio can't be read. Direct alignment: the RB MIDI is
-    authored over the audio (same timeline) → tick→ms via the tempo_map."""
+def _rank01(values):
+    """Song-relative rank of each value in [0, 1] (min→0, max→1). Ties broken by
+    order; a flat distribution maps everything to 0.5. Keeps every audio cue on a
+    common, scale-free axis so loudness/flux/brightness can be blended fairly."""
+    import numpy as np
+    v = np.asarray(values, dtype="float64")
+    n = len(v)
+    if n <= 1 or float(v.max() - v.min()) < 1e-12:
+        return np.full(n, 0.5)
+    order = v.argsort().argsort().astype("float64")
+    return order / (n - 1)
+
+
+def section_energy_scores(paths, sections, tempo_map, tpb: int,
+                          hop_s: float = 0.1) -> list[float] | None:
+    """Composite AUDIO energy score per section in [0, 1], blending three cues
+    (each rank-normalized song-relative, so nothing is hard-coded to dB/BPM):
+      • loudness  — mean RMS (the previous, sole signal)         weight 0.50
+      • flux      — mean spectral flux = how 'busy'/attacky        weight 0.30
+      • brightness— mean spectral centroid = cymbals/distortion    weight 0.20
+    This separates loud-but-dark/static (sustained bass pad) from a truly intense
+    bright, busy chorus — which plain loudness conflated. Returns None on failure."""
     if not sections:
         return None
     if isinstance(paths, str):
@@ -307,26 +323,47 @@ def section_energy_tiers(paths, sections, tempo_map, tpb: int,
     try:
         import numpy as np
         mono, sr = load_mono_mix(paths)
-        env = rms_envelope(mono, sr, hop_s)
+        env = rms_envelope(mono, sr, hop_s)        # loudness, one frame / hop_s
+        mag, hop = _stft_mag(mono, sr)             # frames × bins (for flux+centroid)
     except Exception:
         return None
-    if len(env) == 0:
+    if len(env) == 0 or mag.shape[0] < 4:
         return None
 
-    means: list[float] = []
-    for s in sections:
-        a = tick_to_ms(s.start, tempo_map, tpb) / 1000.0 / hop_s
-        b = tick_to_ms(s.end, tempo_map, tpb) / 1000.0 / hop_s
-        i0 = max(0, int(a))
-        i1 = min(len(env), max(i0 + 1, int(b)))
-        seg = env[i0:i1]
-        means.append(float(np.mean(seg)) if len(seg) else 0.0)
+    # Per-STFT-frame flux (busy-ness) and spectral centroid (brightness).
+    flux = np.concatenate([[0.0], np.maximum(0.0, np.diff(mag, axis=0)).sum(axis=1)])
+    win = (mag.shape[1] - 1) * 2
+    freqs = np.fft.rfftfreq(win, 1.0 / sr)
+    centroid = (mag * freqs[None, :]).sum(axis=1) / (mag.sum(axis=1) + 1e-9)
+    stft_s = hop / sr                              # seconds per STFT frame
 
-    # Thirds of the distribution (same density-driven logic as the sections).
-    s = sorted(means)
+    loud: list[float] = []
+    busy: list[float] = []
+    bright: list[float] = []
+    for s in sections:
+        a_s = tick_to_ms(s.start, tempo_map, tpb) / 1000.0
+        b_s = tick_to_ms(s.end, tempo_map, tpb) / 1000.0
+        i0 = max(0, int(a_s / hop_s)); i1 = min(len(env), max(i0 + 1, int(b_s / hop_s)))
+        seg = env[i0:i1]
+        loud.append(float(np.mean(seg)) if len(seg) else 0.0)
+        j0 = max(0, int(a_s / stft_s)); j1 = min(mag.shape[0], max(j0 + 1, int(b_s / stft_s)))
+        busy.append(float(np.mean(flux[j0:j1])) if j1 > j0 else 0.0)
+        bright.append(float(np.mean(centroid[j0:j1])) if j1 > j0 else 0.0)
+
+    rl, rf, rb = _rank01(loud), _rank01(busy), _rank01(bright)
+    return [float(0.50 * rl[i] + 0.30 * rf[i] + 0.20 * rb[i])
+            for i in range(len(sections))]
+
+
+def section_energy_tiers(paths, sections, tempo_map, tpb: int,
+                         hop_s: float = 0.1) -> list[str] | None:
+    """Energy tier ('calm'/'mid'/'high') per section, via thirds of the composite
+    audio score (loudness+flux+brightness; see section_energy_scores). Returns None
+    if the audio can't be read. Kept for callers that want tiers directly."""
+    scores = section_energy_scores(paths, sections, tempo_map, tpb, hop_s)
+    if scores is None:
+        return None
+    s = sorted(scores)
     lo = s[len(s) // 3]
     hi = s[2 * len(s) // 3]
-    out: list[str] = []
-    for v in means:
-        out.append("calm" if v <= lo else ("mid" if v < hi else "high"))
-    return out
+    return ["calm" if v <= lo else ("mid" if v < hi else "high") for v in scores]

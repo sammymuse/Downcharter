@@ -25,29 +25,105 @@ _AUDIO_ENERGY = {"calm": 0, "mid": 1, "high": 2}
 _ENERGY_NAME = {0: "calm", 1: "mid", 2: "high"}
 
 
+def _rank01(values: list[float]) -> list[float]:
+    """Song-relative rank in [0, 1] (min→0, max→1). Pure-python (no numpy) so the
+    MIDI-only path has no extra dependency. Flat list → all 0.5."""
+    n = len(values)
+    if n <= 1:
+        return [0.5] * n
+    if max(values) - min(values) < 1e-12:
+        return [0.5] * n
+    order = sorted(range(n), key=lambda i: values[i])
+    out = [0.0] * n
+    for r, i in enumerate(order):
+        out[i] = r / (n - 1)
+    return out
+
+
+def _section_midi_cues(mid, sections, part_onsets) -> tuple[list[float], list[float]]:
+    """Two per-section MIDI energy cues (raw, un-normalized):
+      • band fullness — how many instruments play in the section (full chorus vs
+        sparse verse); the strongest structure-free intensity signal.
+      • mean velocity — the chart's real dynamics (accents vs ghost notes).
+    Velocities are read straight from the source MIDI gameplay notes (note < 103)."""
+    import bisect
+    # Onsets grouped per instrument (sorted) → fullness.
+    by_inst: dict[str, list[int]] = {}
+    for nm, ons in part_onsets.items():
+        inst = _part_instrument(nm)
+        if inst:
+            by_inst.setdefault(inst, []).extend(ons)
+    for inst in by_inst:
+        by_inst[inst].sort()
+    n_inst = max(1, len(by_inst))
+    # (tick, velocity) of every gameplay note, for the mean-velocity cue.
+    vel_ticks: list[int] = []
+    vel_vals: list[int] = []
+    for tr in mid.tracks:
+        if _part_instrument(tr.name.strip().upper()) is None:
+            continue
+        t = 0
+        for m in tr:
+            t += m.time
+            if m.type == "note_on" and m.velocity > 0 and getattr(m, "note", 999) < 103:
+                vel_ticks.append(t)
+                vel_vals.append(m.velocity)
+    order = sorted(range(len(vel_ticks)), key=lambda i: vel_ticks[i])
+    vel_ticks = [vel_ticks[i] for i in order]
+    vel_vals = [vel_vals[i] for i in order]
+
+    fullness: list[float] = []
+    velocity: list[float] = []
+    for s in sections:
+        active = sum(1 for ons in by_inst.values()
+                     if bisect.bisect_left(ons, s.end) - bisect.bisect_left(ons, s.start) > 0)
+        fullness.append(active / n_inst)
+        lo = bisect.bisect_left(vel_ticks, s.start)
+        hi = bisect.bisect_left(vel_ticks, s.end)
+        seg = vel_vals[lo:hi]
+        velocity.append(sum(seg) / len(seg) if seg else 0.0)
+    return fullness, velocity
+
+
 def _apply_audio_energy(folder: str, sections, tempo_map, tpb: int,
-                        audio_path: str | None = None) -> bool:
-    """Mix the audio loudness with each section's structural energy.
-    Looks for audio next to the .mid (or uses an explicit `audio_path`). Returns True
-    if applied. Fails gracefully (no libs/audio → doesn't touch the sections)."""
-    from . import audio as _audio
-    if not _audio.available():
-        return False
-    paths = [audio_path] if audio_path else _audio.find_song_audio(folder)
-    if not paths:
-        return False
-    tiers = _audio.section_energy_tiers(paths, sections, tempo_map, tpb)
-    if not tiers:
+                        mid, part_onsets, audio_path: str | None = None) -> bool:
+    """Set each section's energy from a COMPOSITE score, not loudness alone.
+    Blends song-relative cues: audio (loudness+flux+brightness) + MIDI (band
+    fullness + velocity) + the structural type. A chorus must be loud AND busy AND
+    bright AND full to read 'high' — plain volume no longer decides on its own.
+    Returns True if AUDIO was used (kept for the `audio_used` stat); the MIDI cues
+    refine the energy even with no audio (graceful, dependency-free fallback)."""
+    if not sections:
         return False
     from .venue import SECTION_ENERGY
-    for s, atier in zip(sections, tiers):
-        struct = _AUDIO_ENERGY[SECTION_ENERGY.get(s.kind, "calm")]
-        au = _AUDIO_ENERGY[atier]
-        # The AUDIO (real RMS) wins 2:1 over the structure: a part with many notes
-        # but low in volume (e.g. Elegy intro/verse1, dense but calm guitar) stays
-        # calm. The structure only enters as a half-step (avoids unsupported extremes).
-        s.energy = _ENERGY_NAME[round((struct + 2 * au) / 3)]
-    return True
+    full, vel = _section_midi_cues(mid, sections, part_onsets)
+    rfull, rvel = _rank01(full), _rank01(vel)
+    struct = [_AUDIO_ENERGY[SECTION_ENERGY.get(s.kind, "calm")] / 2.0 for s in sections]
+
+    au = None
+    from . import audio as _audio
+    if _audio.available():
+        paths = [audio_path] if audio_path else _audio.find_song_audio(folder)
+        if paths:
+            au = _audio.section_energy_scores(paths, sections, tempo_map, tpb)
+
+    comp: list[float] = []
+    for i in range(len(sections)):
+        if au is not None:
+            # Audio leads (0.45); MIDI performance cues 0.40; structure a light prior.
+            comp.append(0.45 * au[i] + 0.25 * rfull[i] + 0.15 * rvel[i] + 0.15 * struct[i])
+        else:
+            # No audio: MIDI fullness leads, velocity + structure follow.
+            comp.append(0.50 * rfull[i] + 0.25 * rvel[i] + 0.25 * struct[i])
+
+    # Tier by thirds of the song's own distribution (same density-driven logic used
+    # elsewhere; nothing hard-coded to absolute levels).
+    sc = sorted(comp)
+    lo = sc[len(sc) // 3]
+    hi = sc[2 * len(sc) // 3]
+    for s, c in zip(sections, comp):
+        s.energy = "calm" if c <= lo else ("mid" if c < hi else "high")
+    return au is not None
 
 
 _INST_TRACK = {"guitar": "PART GUITAR", "bass": "PART BASS", "drums": "PART DRUMS",
@@ -443,7 +519,7 @@ def process_midi(
         # energy. With no audio/libs, sections.energy stays None (MIDI-only intact).
         stats["audio_used"] = _apply_audio_energy(
             os.path.dirname(os.path.abspath(src_path)), sections, tempo_map, tpb,
-            audio_path)
+            mid, part_onsets, audio_path)
         # Drum hits for the lightshow (synced keyframes + pyro).
         drum_onsets = sorted(
             t for nm, ons in part_onsets.items()
