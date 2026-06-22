@@ -853,6 +853,25 @@ def build_pyro(sections: list[Section], drum_onsets: list[int],
 # filter varies a lot (professional style) but doesn't flicker as fast.
 _PP_CADENCE = {"calm": 7.0, "mid": 4.0, "high": 2.0}
 
+# Post-proc TONE bias by audio timbre (Section.warmth). The pp_study over the 20
+# official venues showed B&W/desaturated filters sit in DARK, quieter audio
+# (bright_p 39) while bright/contrast/filmic filters sit in BRIGHT, loud audio
+# (bright_p 60-67). So a 'cool' (dark) section pulls desaturated presets to the
+# front of its pool, a 'warm' (bright) section pulls bright/contrast ones. Same
+# pp set, just reordered (keeps the calibrated frequency budget); neutral/no-audio
+# section = pool untouched (no-op). Song-relative — no absolute brightness.
+_PP_DARK = ("b+w", "bw", "sepia", "silvertone", "photocopy", "desat", "16mm",
+            "security", "negative")
+_PP_BRIGHT = ("bright", "bloom", "clean", "contrast", "profilm", "video_a")
+
+
+def _pp_tone_pool(pool: list[str], warmth: str | None) -> list[str]:
+    if not warmth:
+        return pool
+    pref = _PP_DARK if warmth == "cool" else _PP_BRIGHT
+    # stable sort: preferred-family filters first, original order preserved within groups
+    return sorted(pool, key=lambda p: 0 if any(k in p.lower() for k in pref) else 1)
+
 
 def build_postproc(sections: list[Section], theme: dict, tpb: int,
                    time_sig_map: list,
@@ -865,6 +884,8 @@ def build_postproc(sections: list[Section], theme: dict, tpb: int,
     for s in sections:
         # Pool BY SECTION TYPE (primary); fallback to the genre palette.
         palette = SECTION_PP_POOL.get(s.kind) or _section_pps(theme, s)
+        # Audio-timbre tone bias (dark->desaturated, bright->bright/contrast).
+        palette = _pp_tone_pool(palette, s.warmth)
         energy = section_energy(s)
         step = max(tpb, int(tpb * _PP_CADENCE[energy]))
         snap_win = tpb // 2
