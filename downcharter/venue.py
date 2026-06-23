@@ -1591,7 +1591,10 @@ def _idle_state(s: Section) -> str:
     energy section stands intense, not slack."""
     if s.kind in ("intro", "outro"):
         return "[idle_realtime]"
-    return "[idle_intense]" if section_energy(s) == "high" else "[idle]"
+    # Use the heaviness-gated tier (same as [intense]/camera): a silent member only
+    # stands 'intense' in a genuinely heavy section (Breakdown), not in a loud-but-
+    # light sung chorus whose 'high' spans were demoted to 'mid'.
+    return "[idle_intense]" if _camera_energy(s) == "high" else "[idle]"
 
 
 _MOOD_LADDER = ["mellow", "play", "intense"]
