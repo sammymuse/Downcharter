@@ -127,8 +127,14 @@ def detect_bre(bre_spans: list[tuple[int, int]] | None) -> list[CutEvent]:
     return out
 
 
-def detect_solos(sections: list[Section], accents: list[int], tpb: int) -> list[CutEvent]:
-    """Solo section → featured soloist: long pre-roll in, close-up, mid-solo flourish."""
+def detect_solos(sections: list[Section], inst_onsets: dict[str, list[int]] | None,
+                 accents: list[int], tpb: int) -> list[CutEvent]:
+    """Solo section → featured soloist: long pre-roll in, close-up, mid-solo flourish.
+
+    The soloist is taken from the section NAME only when that instrument actually plays
+    in the window; otherwise (unnamed solo, or a name that doesn't match the chart) it's
+    derived from CONTENT — whoever leads the window song-relative — instead of blindly
+    defaulting to guitar. Section labels can't be trusted (see detect_impacts)."""
     out = []
     table = {
         "guitar": ["D_Gtr_Cam_PR", "D_Gtr_CLS", "D_Gtr_Cam_PT"],
@@ -137,12 +143,24 @@ def detect_solos(sections: list[Section], accents: list[int], tpb: int) -> list[
         "keys":   ["D_Keys_Cam", "D_Keys"],
         "vocal":  ["D_Vox_Cam_PR", "D_Vox_CLS", "D_Vox_Cam_PT"],
     }
+    totals = ({k: len(v) for k, v in inst_onsets.items()
+               if v and k in ("guitar", "bass", "keys", "drums", "vocal")}
+              if inst_onsets else {})
     for s in sections:
         if s.kind != "solo":
             continue
         n = s.name.lower()
-        inst = next((k for k in ("bass", "drums", "keys", "vocal", "guitar")
-                     if k[:4] in n or k in n), "guitar")
+        named = next((k for k in ("bass", "drums", "keys", "vocal", "guitar")
+                      if k[:4] in n or k in n), None)
+        inst = None
+        # Trust the name only if that instrument actually plays here.
+        if named and _onsets_in(inst_onsets.get(named) if inst_onsets else None,
+                                s.start, s.end):
+            inst = named
+        else:                                          # derive the soloist from content
+            leaders = (_section_leaders(inst_onsets, s.start, s.end, totals)
+                       if inst_onsets else [])
+            inst = leaders[0][0] if leaders else (named or "guitar")
         out.append(CutEvent(_nearest_accent(s.start, accents, tpb), "solo",
                             table[inst], PRIO["solo"], note=f"solo {inst}"))
     return out
@@ -343,7 +361,7 @@ def detect_events(sections: list[Section],
     ev += detect_bre(bre_spans)
     ev += detect_rises(sections, acc, tpb)
     ev += detect_impacts(sections, acc, tpb)
-    ev += detect_solos(sections, acc, tpb)
+    ev += detect_solos(sections, inst_onsets, acc, tpb)
     ev += detect_downtime(inst_onsets, time_sig_map, tpb)
     ev += detect_vocal_peaks(inst_onsets, acc, time_sig_map, tpb)
     ev += detect_features(sections, inst_onsets, acc, tpb)
