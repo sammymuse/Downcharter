@@ -1325,7 +1325,7 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
             idx += 1
             t += max(ms_to_ticks(pace_ms0, t, tempo_map, tpb), min_gap)
     for s in sections:
-        energy = section_energy(s)
+        energy = _camera_energy(s)   # heaviness-gated tier (no jumps on sung loud choruses)
         if s.kind == "solo":
             inst = _solo_instrument(s.name)
             solo_pool = SOLO_CAMERA[inst]
@@ -1387,6 +1387,15 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
                     and s.start - last_allband >= tpb * 32):
                 cand = _ALLBAND_CYCLE[ab_idx % len(_ALLBAND_CYCLE)]
                 ab_idx += 1
+                # all_yeah is the energetic full-band JUMP ("yeah!"). On a non-heavy
+                # section (gated cam energy < high — e.g. a sung loud chorus) skip it
+                # for a neutral full-band shot, so the band doesn't jump like a
+                # breakdown. The full-band PRESENCE (calibrated to the officials) stays.
+                if cand == "D_All_Yeah" and energy != "high":
+                    cand = _ALLBAND_CYCLE[ab_idx % len(_ALLBAND_CYCLE)]
+                    ab_idx += 1
+                    if cand == "D_All_Yeah":
+                        cand = "D_All_LT"
                 start = _snap_to_music(s.start, accents, tpb, floor=last_tick + min_gap)
                 g = _guard_directed(cand, start, tpb, inst_onsets)
                 # No substitution: if the candidate (e.g. all_yeah without vocals) doesn't
@@ -1587,6 +1596,20 @@ def _idle_state(s: Section) -> str:
 
 _MOOD_LADDER = ["mellow", "play", "intense"]
 _ENERGY_LEVEL = {"calm": 0, "mid": 1, "high": 2}
+_LEVEL_ENERGY = {0: "calm", 1: "mid", 2: "high"}
+
+
+def _camera_energy(s: Section) -> str:
+    """Energy tier the CAMERA uses to pick directed cuts (jumps/kicks/crowd vs
+    closeups). Uses the STRONGEST post-gate sub-span tier instead of the section
+    MEAN, so it inherits the heaviness gate: a loud-but-not-heavy chorus whose
+    'high' spans were demoted to 'mid' (sung chorus, not a breakdown) no longer
+    triggers the energetic directed pool / dircut_at_start. Falls back to the
+    section mean when there are no audio spans (MIDI-only path unchanged)."""
+    if s.energy_spans:
+        top = max(_ENERGY_LEVEL.get(t, 0) for _, _, t in s.energy_spans)
+        return _LEVEL_ENERGY[top]
+    return section_energy(s)
 # Order used to STAGGER which instruments soften their mood per section, so the band
 # is not a uniform wall of one mood. mood_study of the 20 official venues: the band
 # has >=2 distinct playing-moods ~43% of moments (median) — they are NOT in unison —
