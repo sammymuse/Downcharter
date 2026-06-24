@@ -1631,15 +1631,35 @@ def build_animations(part_onsets: list[int], sections: list[Section],
     # carries audio sub-spans, the mood FOLLOWS the music within the section (a chorus
     # that starts calm and builds gets [mellow]→[play]→…), instead of one mood per
     # section. Solo/idle still resolve as a whole-section state.
+    import bisect
+
+    def _first_onset_in(a: int, b: int) -> int | None:
+        """This instrument's first onset in [a, b), or None if it rests through the span."""
+        i = bisect.bisect_left(onsets, a)
+        return onsets[i] if i < len(onsets) and onsets[i] < b else None
+
     for i, s in enumerate(sections):
         playing = _count_onsets(onsets, s.start, s.end) > 0
         solo = s.kind == "solo" and _solo_instrument(s.name) == instrument
         if playing and not solo and s.energy_spans:
             for j, (a, b, tier) in enumerate(s.energy_spans):
-                tick = max(s.start if (i == 0 and j == 0) else a - eighth, floor)
+                # A mood change must land on a REAL note of this instrument: anchor on its
+                # first onset in the span (1/8 anticipation), not the bare span boundary —
+                # so the gesture flips when the player actually digs in, not in a gap. If
+                # the instrument rests through this span, emit NO playing-mood here (it was
+                # strumming air at the section's tail spans before).
+                on = _first_onset_in(a, b)
+                if on is None:
+                    continue
+                tick = max(s.start if (i == 0 and j == 0) else on - eighth, floor)
                 if _in_idle(tick):              # instrument is resting here → idle owns it
                     continue
                 timeline.append((tick, _mood_for_level(_ENERGY_LEVEL[tier], instrument, i)))
+        elif playing:
+            on = _first_onset_in(s.start, s.end)
+            tick = max(s.start if i == 0 else (on - eighth if on else s.start - eighth), floor)
+            if not _in_idle(tick):
+                timeline.append((tick, _anim_state(s, playing, instrument, i)))
         else:
             tick = max(s.start if i == 0 else s.start - eighth, floor)
             if not _in_idle(tick):
