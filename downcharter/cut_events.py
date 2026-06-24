@@ -296,6 +296,25 @@ def _onset_near(ons: list[int], t: int) -> int:
     return best
 
 
+def _busiest_onset(ons: list[int], start: int, end: int, tpb: int, prefer: int) -> int:
+    """The onset in [start,end) where the instrument is MOST ACTIVE — the one with the
+    most of its own onsets within ±1 beat. Anchors a feature on the moment the player is
+    actually going off, not a geometric section midpoint that can fall in a lull (so a
+    cut no longer 'appears too early' when the busy part is later in the section). Ties
+    break toward `prefer` (the midpoint) to stay centered when activity is even."""
+    import bisect
+    seg = ons[bisect.bisect_left(ons, start):bisect.bisect_left(ons, end)]
+    if not seg:
+        return prefer
+    best, best_d, best_p = seg[0], -1, 1 << 62
+    for o in seg:
+        d = (bisect.bisect_right(seg, o + tpb) - bisect.bisect_left(seg, o - tpb))
+        p = abs(o - prefer)
+        if d > best_d or (d == best_d and p < best_p):
+            best, best_d, best_p = o, d, p
+    return best
+
+
 def detect_features(sections: list[Section], inst_onsets: dict[str, list[int]] | None,
                     accents: list[int], tpb: int) -> list[CutEvent]:
     """One FEATURE shot per mid/high section that FOLLOWS THE MUSIC: it films whoever
@@ -335,9 +354,11 @@ def detect_features(sections: list[Section], inst_onsets: dict[str, list[int]] |
         cuts += _FEATURE_CLOSEUP.get(lead, [])
         if second:
             cuts += _FEATURE_CLOSEUP.get(second, [])
-        # Anchor on a real onset of the lead instrument near the section midpoint.
+        # Anchor where the LEAD is most active (busiest local onset), not the geometric
+        # midpoint — so the feature lands on the moment the player is actually going off,
+        # never in a mid-section lull.
         lead_ons = inst_onsets.get(lead) or []
-        tick = _onset_near(lead_ons, mid) if lead_ons else mid
+        tick = _busiest_onset(lead_ons, s.start, s.end, tpb, mid) if lead_ons else mid
         out.append(CutEvent(_nearest_accent(tick, accents, tpb), "feature", cuts,
                             PRIO["duo"], note=f"feature {lead}@{s.kind}"))
     return out
