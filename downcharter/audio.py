@@ -122,10 +122,14 @@ def find_song_audio(folder: str) -> list[str]:
 
 def _read_all_or_blocks(src):
     """Read every frame of `src` (a path or BytesIO) to a 2D float32 array.
-    Some encoders emit .opus/.ogg files that libsndfile can read header+stream for
-    but trips on ('Supported file format but file is malformed') when read in one
-    shot. Fall back to BLOCK reading and keep whatever decoded cleanly before the bad
-    page — a partial envelope beats no audio at all. Returns (data2d, sr)."""
+    Some encoders emit .opus/.ogg files that libsndfile decodes fine by SEEK but
+    trips on ('Supported file format but file is malformed') during a SEQUENTIAL
+    read at a few bad pages. (The file is NOT corrupt — seeking past the page works.)
+    Fall back to SEEK-BASED chunked reading: read 1s at a time and, on a bad page,
+    substitute that 1s with silence and seek on. This recovers the WHOLE song
+    (vs sequential block-read, which stops dead at the first bad page) while keeping
+    the timeline aligned (silence gaps stay in place, so section→frame mapping holds).
+    Returns (data2d, sr)."""
     import numpy as np
     import soundfile as sf
     try:
@@ -133,18 +137,25 @@ def _read_all_or_blocks(src):
     except Exception:
         if hasattr(src, "seek"):
             src.seek(0)
-        chunks = []
-        sr = None
         with sf.SoundFile(src) as f:
-            sr = f.samplerate
-            try:
-                for blk in f.blocks(blocksize=131072, dtype="float32", always_2d=True):
-                    chunks.append(blk.copy())
-            except Exception:
-                pass            # stop at the first malformed page, keep what we have
-        if not chunks:
+            sr, ch, total = f.samplerate, f.channels, len(f)
+            chunk = max(1, sr)                    # 1 s
+            out, pos, good = [], 0, 0
+            while pos < total:
+                n = min(chunk, total - pos)
+                try:
+                    f.seek(pos)
+                    d = f.read(n, dtype="float32", always_2d=True)
+                    if len(d) < n:                # short read near a bad page
+                        d = np.vstack([d, np.zeros((n - len(d), ch), "float32")])
+                    good += 1
+                except Exception:
+                    d = np.zeros((n, ch), "float32")     # skip bad page, keep timing
+                out.append(d)
+                pos += n
+        if not good:
             raise
-        return np.concatenate(chunks, axis=0), sr
+        return np.concatenate(out, axis=0), sr
 
 
 def load_mono(path: str):
