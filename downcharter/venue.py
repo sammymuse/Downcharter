@@ -1638,15 +1638,16 @@ def build_animations(part_onsets: list[int], sections: list[Section],
         i = bisect.bisect_left(onsets, a)
         return onsets[i] if i < len(onsets) and onsets[i] < b else None
 
-    # The 1/8 anticipation pulls a mood change BACKWARD across the boundary so it lands
-    # just before the player digs in. That is right when the energy stays equal or DROPS
-    # (the calmer mood may settle early). But on a RISING transition it dragged the louder
-    # gesture — e.g. [intense] (a kick/jump) — an 1/8 into the PRECEDING calmer region,
-    # making the character kick while a calm section is still onscreen. So the anticipated
-    # tick may only land where the LOCAL energy is still ≥ the mood's tier; otherwise it
-    # would cross into a lower-energy pocket — snap forward to the note. Checking the local
-    # tier at the candidate tick (not a stale prev_level) also covers the case where the
-    # instrument RESTED through the calmer span and prev_level kept an old, higher value.
+    # The 1/8 anticipation pulls a mood change BACKWARD so it lands just before the player
+    # digs in. That is right WITHIN one energy region, but across a boundary it bleeds the
+    # new mood into a region of a DIFFERENT tier and misrepresents that 1/8: a RISING move
+    # drags a louder gesture — [intense] (a kick/jump) — into the preceding calm tail (the
+    # character kicks while a calm part is still onscreen); a FALLING move drops a [mellow]
+    # into the loud tail (the character slackens 1/8 too early in a heavy part). So the
+    # anticipated tick may only land where the LOCAL energy equals the mood's own tier;
+    # otherwise it would cross into a different-energy region — snap forward to the note.
+    # Reading the local tier at the candidate tick (not a stale prev_level) also covers the
+    # case where the instrument RESTED through the neighbouring span.
     def _anchor(on: int, first: bool, cur_level: int) -> int:
         if first:
             return max(s.start, floor)
@@ -1654,8 +1655,8 @@ def build_animations(part_onsets: list[int], sections: list[Section],
         if cand < floor:
             return floor
         sec = _section_at(sections, cand)
-        if sec is not None and _ENERGY_LEVEL[_energy_tier_at(sec, cand)] < cur_level:
-            return on                       # anticipating would bleed into a calmer region
+        if sec is not None and _ENERGY_LEVEL[_energy_tier_at(sec, cand)] != cur_level:
+            return on                       # anticipating would cross into a different tier
         return cand
 
     for i, s in enumerate(sections):
@@ -1701,12 +1702,12 @@ def build_animations(part_onsets: list[int], sections: list[Section],
         sec = _section_at(sections, b)
         if sec is not None:
             # Resume on the note that ends the rest, 1/8 early — but, like the section
-            # loop, never let that 1/8 drag a louder mood ([intense]) back into a calmer
-            # pocket of the rest (the character would kick while the screen is still calm).
+            # loop, never let that 1/8 drag the resume mood into a DIFFERENT-tier pocket of
+            # the rest (a louder [intense] back into calm, or a [mellow] into a loud tail).
             res_level = _ENERGY_LEVEL[_energy_tier_at(sec, b)]
             cand = max(b - eighth, a + eighth + 1)
             csec = _section_at(sections, cand)
-            if csec is not None and _ENERGY_LEVEL[_energy_tier_at(csec, cand)] < res_level:
+            if csec is not None and _ENERGY_LEVEL[_energy_tier_at(csec, cand)] != res_level:
                 cand = b
             timeline.append((cand,
                              _anim_state(sec, True, instrument, sections.index(sec))))
