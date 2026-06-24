@@ -43,6 +43,14 @@ _MELODIC = ("guitar", "bass", "keys")
 _IMPACT_KINDS = {"intro", "chorus", "drop", "breakdown", "outro"}
 _RANK = {"calm": 0, "mid": 1, "high": 2}
 
+# The leader rank is SONG-RELATIVE (cnt/own-total). That over-rewards a bass that
+# is sparse over the whole song: in a riff the guitar and bass play near-identical
+# absolute counts, but the bass's smaller denominator makes it "step up" more, so
+# riffs were handed to the bassist. The guitar is the visual focal of a riff, so we
+# give it a modest multiplier — enough to win riffs it co-plays with the bass while
+# leaving genuine vocal/drum leads (which score far higher) untouched.
+_GUITAR_LEAD_BIAS = 1.35
+
 
 def _entry_tier(s: Section) -> str:
     """Energy AT the section's first instant (entry sub-span), not the section peak —
@@ -269,7 +277,10 @@ def _section_leaders(inst_onsets: dict[str, list[int]], start: int, end: int,
         cnt = bisect.bisect_left(ons, end) - bisect.bisect_left(ons, start)
         if cnt < 2:
             continue
-        out.append((inst, cnt / tot))
+        score = cnt / tot
+        if inst == "guitar":
+            score *= _GUITAR_LEAD_BIAS      # see _GUITAR_LEAD_BIAS: surface riffs
+        out.append((inst, score))
     out.sort(key=lambda x: -x[1])
     return out
 
