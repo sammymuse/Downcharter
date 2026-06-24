@@ -40,10 +40,15 @@ def _rank01(values: list[float]) -> list[float]:
     return out
 
 
-def _section_midi_cues(mid, sections, part_onsets) -> tuple[list[float], list[float]]:
-    """Two per-section MIDI energy cues (raw, un-normalized):
+def _section_midi_cues(mid, sections, part_onsets,
+                       tpb: int = 480) -> tuple[list[float], list[float], list[float]]:
+    """Three per-section MIDI energy cues (raw, un-normalized):
       • band fullness — how many instruments play in the section (full chorus vs
-        sparse verse); the strongest structure-free intensity signal.
+        sparse verse). A useful cue, BUT it conflates 'no vocals' with 'low energy':
+        a heavy instrumental outro/breakdown (guitar+bass+drums going hard, no singer)
+        scores only 3/4 and gets wrongly read as calm. So it is no longer used alone.
+      • note density — gameplay onsets per beat (all instruments). Structure-free
+        heaviness that survives a missing vocal track; the primary MIDI-only cue.
       • mean velocity — the chart's real dynamics (accents vs ghost notes).
     Velocities are read straight from the source MIDI gameplay notes (note < 103)."""
     import bisect
@@ -73,6 +78,7 @@ def _section_midi_cues(mid, sections, part_onsets) -> tuple[list[float], list[fl
     vel_vals = [vel_vals[i] for i in order]
 
     fullness: list[float] = []
+    density: list[float] = []
     velocity: list[float] = []
     for s in sections:
         active = sum(1 for ons in by_inst.values()
@@ -82,7 +88,9 @@ def _section_midi_cues(mid, sections, part_onsets) -> tuple[list[float], list[fl
         hi = bisect.bisect_left(vel_ticks, s.end)
         seg = vel_vals[lo:hi]
         velocity.append(sum(seg) / len(seg) if seg else 0.0)
-    return fullness, velocity
+        beats = max(1.0, (s.end - s.start) / float(tpb))
+        density.append((hi - lo) / beats)        # gameplay onsets per beat
+    return fullness, density, velocity
 
 
 def _apply_audio_energy(folder: str, sections, tempo_map, tpb: int,
@@ -98,9 +106,19 @@ def _apply_audio_energy(folder: str, sections, tempo_map, tpb: int,
     if not sections:
         return False
     from .venue import SECTION_ENERGY
-    full, vel = _section_midi_cues(mid, sections, part_onsets)
-    rfull, rvel = _rank01(full), _rank01(vel)
+    full, dens, vel = _section_midi_cues(mid, sections, part_onsets, tpb)
+    rfull, rdens, rvel = _rank01(full), _rank01(dens), _rank01(vel)
     struct = [_AUDIO_ENERGY[SECTION_ENERGY.get(s.kind, "calm")] / 2.0 for s in sections]
+    # CONTENT-AWARE structural prior (labels lie): a TRANSITION section labelled
+    # low-energy (intro/outro/bridge/breakdown/riff → calm prior) but playing at/above
+    # the song's median note density is a busy instrumental passage, not a quiet one.
+    # Floor its structural prior to 'mid' so the calm LABEL can't drag a heavy
+    # instrumental outro/breakdown to 'calm'. Restricted to these transition kinds —
+    # verse/chorus keep their own structural energy meaning untouched.
+    _DECEPTIVE_CALM = {"intro", "outro", "bridge", "breakdown", "riff", "default"}
+    _med = sorted(dens)[len(dens) // 2] if dens else 0.0
+    struct = [max(st, 0.5) if (s.kind in _DECEPTIVE_CALM and d >= _med) else st
+              for st, d, s in zip(struct, dens, sections)]
 
     au = None
     from . import audio as _audio
@@ -122,10 +140,16 @@ def _apply_audio_energy(folder: str, sections, tempo_map, tpb: int,
             # only (they track note count, not felt intensity) and the structural
             # prior is barely-there (0.05) so energy is NOT locked to section type —
             # a busy chorus no longer auto-reads 'high'.
-            comp.append(0.78 * au[i] + 0.12 * rfull[i] + 0.05 * rvel[i] + 0.05 * struct[i])
+            comp.append(0.78 * au[i] + 0.06 * rfull[i] + 0.06 * rdens[i]
+                        + 0.05 * rvel[i] + 0.05 * struct[i])
         else:
-            # No audio: MIDI fullness leads, velocity + structure follow.
-            comp.append(0.50 * rfull[i] + 0.25 * rvel[i] + 0.25 * struct[i])
+            # No audio: note DENSITY leads (survives a missing vocal track), band
+            # fullness + structure support, velocity is the weakest (charts are often
+            # near-flat in velocity). Density-led so a heavy instrumental outro/
+            # breakdown (no singer) is no longer dragged to 'calm' by the fullness
+            # penalty — it reads by how busy the band actually is.
+            comp.append(0.45 * rdens[i] + 0.20 * rfull[i] + 0.25 * struct[i]
+                        + 0.10 * rvel[i])
 
     # Tier by FIXED thresholds on the composite itself — NOT forced thirds, and NOT
     # re-normalized to this song's range (which would undo the song-relative meaning

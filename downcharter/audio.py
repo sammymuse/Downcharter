@@ -120,20 +120,44 @@ def find_song_audio(folder: str) -> list[str]:
     return moggs[:1]
 
 
-def load_mono(path: str):
-    """Decode the audio to mono float32. Handles .mogg (header strip)."""
+def _read_all_or_blocks(src):
+    """Read every frame of `src` (a path or BytesIO) to a 2D float32 array.
+    Some encoders emit .opus/.ogg files that libsndfile can read header+stream for
+    but trips on ('Supported file format but file is malformed') when read in one
+    shot. Fall back to BLOCK reading and keep whatever decoded cleanly before the bad
+    page — a partial envelope beats no audio at all. Returns (data2d, sr)."""
     import numpy as np
     import soundfile as sf
+    try:
+        return sf.read(src, dtype="float32", always_2d=True)
+    except Exception:
+        if hasattr(src, "seek"):
+            src.seek(0)
+        chunks = []
+        sr = None
+        with sf.SoundFile(src) as f:
+            sr = f.samplerate
+            try:
+                for blk in f.blocks(blocksize=131072, dtype="float32", always_2d=True):
+                    chunks.append(blk.copy())
+            except Exception:
+                pass            # stop at the first malformed page, keep what we have
+        if not chunks:
+            raise
+        return np.concatenate(chunks, axis=0), sr
 
+
+def load_mono(path: str):
+    """Decode the audio to mono float32. Handles .mogg (header strip)."""
     if path.lower().endswith(".mogg"):
         raw = open(path, "rb").read()
         version = struct.unpack("<I", raw[:4])[0]
         if version != 0x0A:
             raise ValueError(f"encrypted mogg (version {version}) not supported")
         offset = struct.unpack("<I", raw[4:8])[0]
-        data, sr = sf.read(io.BytesIO(raw[offset:]), dtype="float32", always_2d=True)
+        data, sr = _read_all_or_blocks(io.BytesIO(raw[offset:]))
     else:
-        data, sr = sf.read(path, dtype="float32", always_2d=True)
+        data, sr = _read_all_or_blocks(path)
     return data.mean(axis=1), sr
 
 
@@ -445,6 +469,13 @@ def section_energy_scores(paths, sections, tempo_map, tpb: int,
     if env is None:
         return None
     import numpy as np
+    # COVERAGE GUARD: a malformed .opus/.ogg may only decode partway (libsndfile stops
+    # at the first bad page). A half-decoded envelope would score every uncovered
+    # section ~0 → wrongly 'calm'. If the audio doesn't cover ≥80% of the song, bail
+    # to None so the whole song uses the (consistent) MIDI-only fallback instead.
+    song_end_s = tick_to_ms(sections[-1].end, tempo_map, tpb) / 1000.0
+    if song_end_s > 0 and len(env) * stft_s < 0.80 * song_end_s:
+        return None
     out: list[float] = []
     for s in sections:
         a_s = tick_to_ms(s.start, tempo_map, tpb) / 1000.0
@@ -493,6 +524,11 @@ def section_energy_subspans(paths, sections, tempo_map, tpb: int,
     if feats is None:
         return None
     import numpy as np
+    # COVERAGE GUARD (see section_energy_scores): a half-decoded malformed file would
+    # leave the song's tail without sub-spans → bail so it stays MIDI-only & consistent.
+    song_end_s = tick_to_ms(sections[-1].end, tempo_map, tpb) / 1000.0
+    if song_end_s > 0 and len(feats["loud"]) * stft_s < 0.80 * song_end_s:
+        return None
     # Composite FEEL envelope (same blend as feel_envelope) + a song-relative
     # HEAVINESS envelope (low-end + flatness + darkness), both from one STFT pass.
     env = np.zeros(len(feats["loud"]), dtype="float64")
