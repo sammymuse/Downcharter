@@ -219,12 +219,10 @@ def grapheme_to_phonemes(frag: str, lang: str = "en") -> list[str]:
     return out
 
 
-def _syllable_shape(text: str, lang: str = "en") -> tuple[list[dict], tuple[dict, dict | None], list[dict]]:
-    """Lyric fragment → (initial consonants, (vowel, end|None), final consonants).
+def _shape_from_phones(phones: list[str]) -> tuple[list[dict], tuple[dict, dict | None], list[dict]]:
+    """Phoneme list → (initial consonants, (vowel, end|None), final consonants).
 
     Visemes already resolved (name→weight dicts). No vowel → AH fallback (neutral mouth)."""
-    phones = grapheme_to_phonemes(text, lang)
-    # index of the 1st vowel
     vi = next((k for k, p in enumerate(phones) if p in _VOWEL_SET), None)
     if vi is None:
         return [], _VOWELS["AH"], []
@@ -238,6 +236,55 @@ def _syllable_shape(text: str, lang: str = "en") -> tuple[list[dict], tuple[dict
         if p in _CONS:
             final.append(_CONS[p])
     return initial, vowel, final
+
+
+def _syllable_shape(text: str, lang: str = "en") -> tuple[list[dict], tuple[dict, dict | None], list[dict]]:
+    """Lyric fragment → mouth shape, via G2P on the fragment alone (no word context)."""
+    return _shape_from_phones(grapheme_to_phonemes(text, lang))
+
+
+def _strip_markers(text: str) -> str:
+    """Lyric text without trailing RB markers (#/^/+/*/% and surrounding space)."""
+    return text.rstrip().rstrip("#^+*%").rstrip()
+
+
+def _word_continues(text: str) -> bool:
+    """True if this syllable joins the next one (trailing '-'/'=' = same word)."""
+    return _strip_markers(text).endswith(("-", "="))
+
+
+def align_word_phonemes(syllables: list[str], lang: str = "en") -> list[list[str]] | None:
+    """Distribute a word's CMUdict phonemes across its WRITTEN syllables.
+
+    `syllables` = the consecutive lyric fragments of ONE word (e.g. ['el-','e-','gy']).
+    Looks the whole word up in the dictionary, then splits its phoneme sequence so each
+    written syllable gets exactly one vowel nucleus (consonant clusters between two
+    nuclei are split in the middle). Returns one phoneme list per syllable, or None when
+    no reliable alignment exists (non-English, OOV, or #nuclei != #syllables) → caller
+    falls back to per-fragment G2P. This fixes hyphenated multi-syllable words, whose
+    fragments aren't whole words and so missed the dictionary before."""
+    if lang != "en":
+        return None
+    clean = ["".join(c for c in s.lower() if c.isalpha()) for s in syllables]
+    word = "".join(clean)
+    if not word:
+        return None
+    phones = _cmudict().get(word)
+    if not phones:
+        return None
+    nuclei = [k for k, p in enumerate(phones) if p in _VOWEL_SET]
+    if len(nuclei) != len(syllables):
+        return None  # our written split disagrees with the dict → don't force it
+    out: list[list[str]] = []
+    prev = 0
+    for k, nuc in enumerate(nuclei):
+        if k + 1 < len(nuclei):
+            boundary = (nuc + nuclei[k + 1]) // 2 + 1  # split medial cluster ~evenly
+            out.append(phones[prev:boundary])
+            prev = boundary
+        else:
+            out.append(phones[prev:])
+    return out
 
 
 # ───────────────────────── building the keyframes ────────────────────────────
@@ -389,18 +436,38 @@ def lipsync_events_from_spans(spans, song_len_s: float, lang: str = "en"):
     viseme weight by the syllable's loudness (1.0 = full). The mouth opens at
     start_s, sustains the vowel, and closes by end_s — the true note length the audio
     confirmed — so the lipsync matches when the singer actually stops. This is what
-    sets us apart from Onyx/YARG's built-in generators (both geometric, audio-blind)."""
+    sets us apart from Onyx/YARG's built-in generators (both geometric, audio-blind).
+
+    Consecutive spans of the SAME word (trailing '-'/'=') are grouped so the whole word
+    is looked up in CMUdict and its phonemes aligned per written syllable
+    (`align_word_phonemes`); on a miss each fragment falls back to per-fragment G2P."""
+    spans = list(spans)
+    n = len(spans)
+    # Pre-resolve each span's mouth shape, grouping syllables into words for the dict.
+    shapes: list = [None] * n
+    i = 0
+    while i < n:
+        j = i
+        while j < n - 1 and _word_continues(spans[j][2]):
+            j += 1
+        group = spans[i:j + 1]                      # the fragments of one word
+        aligned = align_word_phonemes([sp[2] for sp in group], lang)
+        for k in range(len(group)):
+            shapes[i + k] = (_shape_from_phones(aligned[k]) if aligned is not None
+                             else _syllable_shape(group[k][2], lang))
+        i = j + 1
+
     frames: dict[int, dict] = {}
-    for sp in spans:
-        t, end, text = sp[0], sp[1], sp[2]
+    for sp, shape in zip(spans, shapes):
+        t, end = sp[0], sp[1]
         gain = sp[3] if len(sp) > 3 else 1.0
         dur = end - t
         if dur <= 0:
             continue
-        pts = _syllable_points(t, dur, _syllable_shape(text, lang))
+        pts = _syllable_points(t, dur, shape)
         if gain != 1.0:
-            pts = [(pt_t, {n: max(0, min(255, int(round(w * gain))))
-                           for n, w in st.items()})
+            pts = [(pt_t, {nm: max(0, min(255, int(round(w * gain))))
+                           for nm, w in st.items()})
                    for pt_t, st in pts]
         _sample_into(frames, pts)
     n_frames = max(1, int(math.ceil(song_len_s * FPS)) + 1)
