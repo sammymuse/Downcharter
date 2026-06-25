@@ -22,6 +22,7 @@ from __future__ import annotations
 import mido
 
 from .constants import DRUM_KICK_EXPERT, DRUM_KICK_2X
+from .midi_utils import build_tempo_map, tick_to_ms
 
 
 def _is_drums_track(track: mido.MidiTrack) -> bool:
@@ -71,29 +72,108 @@ def convert_open_notes(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
 
 # ── drum limb animations ───────────────────────────────────────────────────────
 # RB3 animates the drummer from dedicated animation notes (24-51 on PART DRUMS).
-# YARG auto-animates from the chart, but RB3 needs them authored, so a YARG chart
-# with no animation notes leaves the drummer idle. We synthesise them from the
-# Expert gems using the classic rock sticking: right hand leads the cymbals/ride,
-# left hand plays the snare; pro-tom markers (110/111/112) turn the
-# yellow/blue/green lanes into toms.
-_ANIM_KICK      = 24
-_ANIM_SNARE_LH  = 26   # hard
-_ANIM_HIHAT_RH  = 31
-_ANIM_RIDE_RH   = 42
-_ANIM_CRASH_RH  = 36   # crash 1, right hand, hard
-_ANIM_TOM1_RH   = 47   # yellow tom
-_ANIM_TOM2_RH   = 49   # blue tom
-_ANIM_FLOOR_RH  = 51   # green/floor tom
-_TOM_MARKERS    = (110, 111, 112)
+# YARG auto-animates from the chart, but RB3 needs them authored, so a chart with
+# no animation notes leaves the drummer idle. We synthesise them from the Expert
+# Pro-drum gems with proper LEFT/RIGHT-HAND sticking — a faithful port of Onyx's
+# `autoDrumAnimation`/`autoSticking` (mtolly/onyx, Onyx/MIDI/Track/Drums.hs):
+#
+#   * Each gem maps to an "anim pad" (snare, hihat, ride, crashes, toms), with
+#     pro-tom markers (110/111/112) turning the yellow/blue/green lanes into toms.
+#   * Simultaneous hits split between the hands (lower kit position → LH, higher
+#     → RH); special chords (two cymbals → both crashes; red+yellow-tom → snare
+#     flam) match Onyx.
+#   * Single hits within 0.25 s of each other form a "phrase" whose sticking
+#     alternates hands, leading with the hand that keeps the drummer from crossing
+#     over on the next hit (double-strokes are delayed to the latest moment).
+#
+# The full RB3 animation note map (per Onyx `parseDrumAnimation`):
+#   24 kick(RF) · 26/27 snare LH/RH · 30/31 hihat LH/RH · 34/36 crash1 LH/RH ·
+#   38 crash2 RH · 42/43 ride RH/LH · 44 crash2 LH · 46/47 tom1 LH/RH ·
+#   48/49 tom2 LH/RH · 50/51 floortom LH/RH
+_TOM_MARKERS = (110, 111, 112)
+
+# Anim pads, ordered left→right across the kit (used for hand assignment and the
+# "normal direction" of motion). Mirrors Onyx's `AnimPad` Ord.
+_SNARE, _HIHAT, _CRASH1, _TOM1, _TOM2, _FLOOR, _CRASH2, _RIDE = range(8)
+_LH, _RH = "LH", "RH"
+
+# (pad, hand) → RB3 animation note. Hard hits only (we don't author ghost notes).
+_ANIM_NOTE = {
+    (_SNARE, _LH): 26,  (_SNARE, _RH): 27,
+    (_HIHAT, _LH): 30,  (_HIHAT, _RH): 31,
+    (_CRASH1, _LH): 34, (_CRASH1, _RH): 36,
+    (_TOM1, _LH): 46,   (_TOM1, _RH): 47,
+    (_TOM2, _LH): 48,   (_TOM2, _RH): 49,
+    (_FLOOR, _LH): 50,  (_FLOOR, _RH): 51,
+    (_CRASH2, _LH): 44, (_CRASH2, _RH): 38,
+    (_RIDE, _LH): 43,   (_RIDE, _RH): 42,
+}
+_ANIM_KICK = 24
+
+
+def _flip(hand: str) -> str:
+    return _RH if hand == _LH else _LH
+
+
+def _normal_direction(x: int, y: int):
+    """Natural hand when moving from pad x to pad y (None = no preference).
+    Hihat↔snare and snare↔tom1 are centred, so neither implies a direction."""
+    if (x, y) in ((_HIHAT, _SNARE), (_SNARE, _HIHAT), (_SNARE, _TOM1), (_TOM1, _SNARE)):
+        return None
+    if x < y:
+        return _RH
+    if x > y:
+        return _LH
+    return None
+
+
+def _auto_sticking(pads: list[int]) -> list[str]:
+    """Assign LH/RH to a phrase of single hits (Onyx `autoSticking`)."""
+    out: list[str] = []
+    prev = None                       # None | (hand, pad)
+    for i, x in enumerate(pads):
+        rest = pads[i + 1:]
+        if prev is None:
+            # Look ahead: first non-None direction decides the starting hand so the
+            # run lands correctly; flip if an even number of "free" moves precede it.
+            dirs = [_normal_direction(a, b) for a, b in zip(pads[i:], rest)]
+            n, h = 0, None
+            for d in dirs:
+                if d is None:
+                    n += 1
+                else:
+                    h = d
+                    break
+            if h is None:
+                hand = _RH
+            else:
+                hand = _flip(h) if n % 2 == 0 else h
+        else:
+            prev_hand, prev_pad = prev
+            if x == prev_pad:
+                # Same pad: keep the hand (double stroke) only if that sets us up to
+                # NOT cross over on the next hit; otherwise alternate.
+                if rest and _flip(prev_hand) == _normal_direction(x, rest[0]):
+                    hand = prev_hand
+                else:
+                    hand = _flip(prev_hand)
+            else:
+                hand = _flip(prev_hand)   # moving pads always switches hands
+        out.append(hand)
+        prev = (hand, x)
+    return out
 
 
 def generate_drum_animations(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
     """Return a NEW MidiFile with drummer limb-animation notes (24-51) synthesised
-    on PART DRUMS from its Expert gems. No-op for a drums track that is already
-    animated. Returns (new_mid, {"added": n}). Never mutates the input."""
+    on PART DRUMS from its Expert gems, with left/right-hand sticking. No-op for a
+    drums track that is already animated. Returns (new_mid, {"added": n}). Never
+    mutates the input."""
     out = mido.MidiFile(type=mid.type, ticks_per_beat=mid.ticks_per_beat)
     tpb = mid.ticks_per_beat
     anim_len = max(1, tpb // 8)
+    tempo_map = build_tempo_map(mid)
+    close_ms = 250.0                  # Onyx closeTime = 0.25 s
     added = 0
 
     for track in mid.tracks:
@@ -133,27 +213,94 @@ def generate_drum_animations(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
         def _is_tom(marker: int, tick: int) -> bool:
             return any(a <= tick < b for a, b in spans[marker])
 
-        # Map each Expert gem to one animation note.
-        anim: list[tuple[int, int]] = []
+        # Collect Expert gems per tick (one set of lanes per onset).
+        gems_at: dict[int, set] = {}
         for tick, m in abs_msgs:
             if not (m.type == "note_on" and m.velocity > 0):
                 continue
             n = m.note
             if n in (DRUM_KICK_EXPERT, DRUM_KICK_2X):
-                note = _ANIM_KICK
-            elif n == 97:                                   # red → snare
-                note = _ANIM_SNARE_LH
-            elif n == 98:                                   # yellow → tom1 / hihat
-                note = _ANIM_TOM1_RH if _is_tom(110, tick) else _ANIM_HIHAT_RH
-            elif n == 99:                                   # blue → tom2 / ride
-                note = _ANIM_TOM2_RH if _is_tom(111, tick) else _ANIM_RIDE_RH
-            elif n in (100, 101):                           # green → floor / crash
-                note = _ANIM_FLOOR_RH if _is_tom(112, tick) else _ANIM_CRASH_RH
+                lane = "kick"
+            elif n == 97:
+                lane = "red"
+            elif n == 98:
+                lane = "yellow_tom" if _is_tom(110, tick) else "yellow_cym"
+            elif n == 99:
+                lane = "blue_tom" if _is_tom(111, tick) else "blue_cym"
+            elif n in (100, 101):
+                lane = "green_tom" if _is_tom(112, tick) else "green_cym"
             else:
                 continue
-            anim.append((tick, note))
+            gems_at.setdefault(tick, set()).add(lane)
 
-        # Merge gems + animation pairs, drop the old end-of-track, re-time.
+        # Per-onset → list of anim pads (Onyx `autoDrumAnimation`). Kicks are
+        # emitted directly as note 24; everything else feeds the sticking pass.
+        _LANE_PAD = {
+            "red": _SNARE, "yellow_cym": _HIHAT, "blue_cym": _RIDE,
+            "green_cym": _CRASH2, "yellow_tom": _TOM1, "blue_tom": _TOM2,
+            "green_tom": _FLOOR,
+        }
+        kicks: list[int] = []
+        events: list[tuple] = []      # ("pair", tick, lo, hi) | ("single", tick, pad)
+        for tick in sorted(gems_at):
+            lanes = gems_at[tick]
+            if "kick" in lanes:
+                kicks.append(tick)
+            # Special chords (match Onyx ordering).
+            if {"yellow_cym", "green_cym"} <= lanes \
+                    or {"blue_cym", "green_cym"} <= lanes:
+                pads = [_CRASH1, _CRASH2]
+            elif {"red", "yellow_tom"} <= lanes:
+                pads = [_SNARE, _SNARE]
+            else:
+                pads = sorted(_LANE_PAD[l] for l in lanes if l in _LANE_PAD)
+            if not pads:
+                continue
+            if len(pads) >= 2:
+                events.append(("pair", tick, min(pads), max(pads)))
+            else:
+                events.append(("single", tick, pads[0]))
+
+        # Walk the event stream; flush single-hit phrases through _auto_sticking.
+        anim: list[tuple[int, int]] = []   # (tick, note)
+
+        def _emit(tick: int, pad: int, hand: str) -> None:
+            anim.append((tick, _ANIM_NOTE[(pad, hand)]))
+
+        buffer: list[tuple[int, int]] = []   # (tick, pad)
+
+        def _flush() -> None:
+            if not buffer:
+                return
+            hands = _auto_sticking([p for _, p in buffer])
+            for (btick, pad), hand in zip(buffer, hands):
+                _emit(btick, pad, hand)
+            buffer.clear()
+
+        prev_tick = None
+        for ev in events:
+            if ev[0] == "pair":
+                _flush()
+                _, tick, lo, hi = ev
+                _emit(tick, lo, _LH)
+                _emit(tick, hi, _RH)
+                prev_tick = tick
+            else:
+                _, tick, pad = ev
+                if buffer and prev_tick is not None and \
+                        (tick_to_ms(tick, tempo_map, tpb)
+                         - tick_to_ms(prev_tick, tempo_map, tpb)) <= close_ms:
+                    buffer.append((tick, pad))
+                else:
+                    _flush()
+                    buffer.append((tick, pad))
+                prev_tick = tick
+        _flush()
+
+        for tick in kicks:
+            anim.append((tick, _ANIM_KICK))
+
+        # Merge gems + animation note pairs, drop the old end-of-track, re-time.
         merged = [(tick, m) for tick, m in abs_msgs if m.type != "end_of_track"]
         for tick, note in anim:
             merged.append((tick, mido.Message("note_on", note=note, velocity=96, time=0)))
