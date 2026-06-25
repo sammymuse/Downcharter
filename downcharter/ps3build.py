@@ -6,24 +6,18 @@ Phase-2 lipsync change came out byte-identical), so our lipsync wasn't reaching
 the game. By building the milo ourselves (downcharter/milo.py) we guarantee the
 lipsync we generate is in the file the game loads.
 
-This module wires that milo into the file system. It is being rolled out in two
-steps, smallest-blast-radius first:
+The .milo is built ONCE, here, at conversion time. Processing only authors the
+audio-guided LIPSYNC1 track inside notes.mid (downcharter/processor `_apply_lipsync`);
+it does NOT write any milo. When a folder is converted into a PS3 pack,
+`build_ps3_song` reconstructs the same audio-guided syllable spans the LIPSYNC1
+track was authored from — straight off the charted PART VOCALS talky tubes (whose
+ends are already audio-trimmed) plus their lyrics, re-deriving the per-syllable
+loudness gain from the vocal stem — and feeds them to `milo.build_milo_from_spans`
+(the validated 30 fps path). One milo, made when the pack is assembled, guaranteed
+to carry our lipsync.
 
-  1. `write_milo_sidecar` (LIVE): during normal processing, write a
-     `<song>.milo_ps3` next to the processed notes.mid, built from the same
-     audio-guided syllable spans as the LIPSYNC1 track. A PS3 .milo_ps3 and an
-     Xbox .milo_xbox have identical bodies, so the same bytes serve both — we
-     also drop a `.milo_xbox` copy. This lets us A/B test the milo IN-GAME by
-     swapping it into a known-good RPCS3 pack's `gen/` folder, BEFORE investing
-     in from-scratch dta/mogg/folder generation. (Decided test-first: confirm
-     the milo carries our lipsync in-game first.)
-
-  2. `build_ps3_song` (TODO, pending step 1's in-game validation + the
-     unencrypted .mid / .mogg-version questions): lay out the full unencrypted
-     PS3 song folder — `<ID>/songs/<id>/<id>.mid` (plain), `<id>.mogg` (reuse the
-     source mogg verbatim, per the decision to keep it as-is), `gen/<id>.milo_ps3`,
-     and a generated `songs/songs.dta`. The Xbox-360 CON/STFS packer is a later
-     follow-up (downcharter/stfs.py) reusing the same milo + dta + mogg.
+The Xbox-360 CON/STFS packer is a later follow-up (downcharter/stfs.py) reusing the
+same milo + dta + mogg.
 """
 from __future__ import annotations
 import os
@@ -36,6 +30,10 @@ from . import milo as _milo
 from . import convert as _convert
 from . import mogg as _mogg
 from . import edat as _edat
+from .midi_utils import build_tempo_map, tick_to_ms, to_abs
+
+# PART VOCALS talky pitch authored by processor._chart_vocals_from_lyrics.
+_VOCAL_TALKY_PITCH = 50
 
 
 def _noop_log(msg, tag=None):
@@ -91,26 +89,79 @@ def _tier_to_rank(tier) -> int:
         return 270
 
 
-def _lyric_spans(mid) -> list:
-    """Extract syllable spans [(start_s, end_s, text, gain)] from the MIDI lyrics,
-    timed in real seconds. A YARG/CH chart's lyrics are already aligned to the
-    vocal, so geometric spans (each syllable → up to the next) drive a faithful
-    enough milo without re-doing audio analysis. Bracketed markers like
-    [section ...] / [phrase] are skipped."""
-    lyrics: list[tuple[float, str]] = []
-    t = 0.0
-    for msg in mid:                       # MidiFile iteration yields real seconds
-        t += msg.time
-        if msg.type in ("lyrics", "text"):
-            txt = (msg.text or "").strip()
-            if not txt or txt.startswith("["):
-                continue
-            lyrics.append((t, txt))
+def _audio_guided_spans(mid, folder: str) -> list:
+    """Reconstruct the audio-guided syllable spans [(start_s, end_s, text, gain)]
+    that the LIPSYNC1 track was authored from, so the milo built here matches the
+    track exactly — no re-doing geometry.
+
+    The Process tab already charted PART VOCALS as talky tubes (note 50) whose
+    note ENDS were trimmed against the vocal stem, and tagged each lyric '#'. We
+    read those tubes ONLY off the PART VOCALS track (not a merged view — drum
+    animation notes also live in 24-51), pair each with its lyric, convert ticks
+    → seconds via the chart's tempo map, and re-derive the per-syllable loudness
+    gain from the vocal stem in `folder`. These are the same spans the LIPSYNC1
+    keyframes came from, so `milo.build_milo_from_spans` reproduces our lipsync."""
+    idx = next((i for i, t in enumerate(mid.tracks)
+                if (t.name or "").strip().upper() == "PART VOCALS"), None)
+    if idx is None:
+        return []
+    tempo_map = build_tempo_map(mid)
+    tpb = mid.ticks_per_beat
+    abs_evts = to_abs(mid.tracks[idx])
+
+    gems: list[tuple[int, int]] = []          # (start_tick, end_tick) talky tubes
+    open_t = None
+    for e in abs_evts:
+        m = e.msg
+        is_off = m.type == "note_off" or (m.type == "note_on"
+                                          and getattr(m, "velocity", 0) == 0)
+        if (m.type == "note_on" and getattr(m, "velocity", 0) > 0
+                and getattr(m, "note", None) == _VOCAL_TALKY_PITCH):
+            open_t = e.abs_tick
+        elif is_off and getattr(m, "note", None) == _VOCAL_TALKY_PITCH:
+            if open_t is not None:
+                gems.append((open_t, e.abs_tick))
+                open_t = None
+    if not gems:
+        return []
+
+    lyr = [(e.abs_tick, e.msg.text.strip()) for e in abs_evts
+           if e.msg.type in ("lyrics", "lyric", "text")
+           and getattr(e.msg, "text", "") and not e.msg.text.strip().startswith("[")]
+    lyr.sort(key=lambda lt: lt[0])
+
+    # Vocal-stem loudness for the per-syllable gain (no-op without audio).
+    va = None
+    try:
+        from . import audio as _audio
+        if _audio.available():
+            stems = _audio.find_vocal_stems(folder)
+            if stems:
+                va = _audio.voice_activity(stems)
+    except Exception:
+        va = None
+
+    tol = max(1, tpb // 4)
     spans = []
-    for i, (start, txt) in enumerate(lyrics):
-        end = lyrics[i + 1][0] if i + 1 < len(lyrics) else start + 0.3
-        end = max(start + 0.05, min(end, start + 1.2))   # clamp to a sane mouth span
-        spans.append((start, end, txt, 1.0))
+    for s_t, e_t in gems:
+        best = None
+        for lt, tx in lyr:
+            if abs(lt - s_t) <= tol and (best is None or abs(lt - s_t) < abs(best[0] - s_t)):
+                best = (lt, tx)
+        # strip the talky markers ('#'/'^') the chart carries; keep '-'/'=' (the
+        # G2P syllable-grouping the milo path expects).
+        text = best[1].rstrip("#^ ").strip() if best else ""
+        if not text or text in ("+", "*", "%"):
+            continue
+        s_s = tick_to_ms(s_t, tempo_map, tpb) / 1000.0
+        e_s = tick_to_ms(e_t, tempo_map, tpb) / 1000.0
+        gain = 1.0
+        if va is not None:
+            try:
+                gain = _audio.syllable_gain(va, s_s, e_s)
+            except Exception:
+                gain = 1.0
+        spans.append((s_s, e_s, text, gain))
     return spans
 
 
@@ -426,26 +477,25 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
     else:
         mogg_layout = _mogg.build_mogg_from_stems(src_folder, out_mogg, log)
 
-    # 3) MILO: prefer a Process-tab sidecar (audio-guided lipsync); otherwise
-    #    build one here from the chart's lyrics so the singer still lipsyncs.
+    # 3) MILO: build OUR lipsync milo here — this is the ONLY place a milo is made.
+    #    Processing already authored the audio-guided LIPSYNC1 track; we reconstruct
+    #    the very spans it came from (charted PART VOCALS talky tubes + lyrics +
+    #    vocal-stem gain) and serialise the milo with the validated 30 fps path. A
+    #    pre-existing source milo is used only as a fallback for instrumental charts.
     milo_out = os.path.join(gen_dir, f"{shortname}.milo_ps3")
-    if milo_path:
-        shutil.copy2(milo_path, milo_out)
-        tag = "sidecar (our lipsync)" if milo_path.endswith(".milo_ps3") \
-            and os.path.dirname(milo_path) == os.path.dirname(mid_path) else "reused"
-        log(f"    ◇ milo: {tag}\n", "info")
-    else:
-        try:
-            spans = _lyric_spans(out_mid)
-            if spans:
-                song_len_s = out_mid.length
-                with open(milo_out, "wb") as f:
-                    f.write(_milo.build_milo_from_spans(spans, song_len_s))
-                log(f"    ◇ milo: generated from {len(spans)} lyric syllable(s)\n", "info")
-            else:
-                log(f"    ⚠ milo: no lyrics in chart — skipped (no lipsync)\n", "warn")
-        except Exception as e:
-            log(f"    ⚠ milo: lyric lipsync failed ({e}) — skipped\n", "warn")
+    try:
+        spans = _audio_guided_spans(out_mid, src_folder)
+        if spans:
+            with open(milo_out, "wb") as f:
+                f.write(_milo.build_milo_from_spans(spans, out_mid.length))
+            log(f"    ◇ milo: built from {len(spans)} audio-guided syllable(s)\n", "info")
+        elif milo_path:
+            shutil.copy2(milo_path, milo_out)
+            log(f"    ◇ milo: no charted vocals — reused source milo\n", "info")
+        else:
+            log(f"    ⚠ milo: no charted vocals — skipped (no lipsync)\n", "warn")
+    except Exception as e:
+        log(f"    ⚠ milo: lipsync build failed ({e}) — skipped\n", "warn")
 
     # 4) Album art (optional)
     if art_path:
@@ -469,25 +519,3 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
 
     log(f"  ✓ {pkg}\n", "ok")
     return out_root
-
-
-def write_milo_sidecar(dst_mid_path: str, spans, song_len_s: float,
-                       lang: str = "en") -> list[str]:
-    """Build the .milo from the lipsync spans and write it next to the MIDI.
-
-    `spans` = [(start_s, end_s, text, gain)] (the same audio-guided syllable
-    spans that drive the LIPSYNC1 track). Writes `<base>.milo_ps3` and an
-    identical `<base>.milo_xbox` (the body is platform-independent; only the
-    outer CON/STFS wrapper differs). Returns the paths written (empty if there's
-    nothing to build). Never raises into the caller's pipeline."""
-    if not spans or song_len_s <= 0:
-        return []
-    milo_bytes = _milo.build_milo_from_spans(spans, song_len_s, lang)
-    base = os.path.splitext(dst_mid_path)[0]
-    written: list[str] = []
-    for ext in (".milo_ps3", ".milo_xbox"):
-        path = base + ext
-        with open(path, "wb") as f:
-            f.write(milo_bytes)
-        written.append(path)
-    return written
