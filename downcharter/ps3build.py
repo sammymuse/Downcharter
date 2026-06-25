@@ -91,9 +91,38 @@ def _tier_to_rank(tier) -> int:
         return 270
 
 
-def _build_dta(meta: dict, shortname: str, layout, mode: str) -> str:
+def _charted_instruments(mid) -> set:
+    """Which RB instruments are actually charted in `mid` (by PART track + gems).
+    Returns a subset of {drum, bass, guitar, keys, vocals}. An instrument audio
+    stem with no chart (e.g. bass audio but no PART BASS gems) must NOT appear as
+    a playable track in the dta — it just becomes backing audio."""
+    name_map = [("DRUM", "drum"), ("BASS", "bass"), ("GUITAR", "guitar"),
+                ("KEYS", "keys"), ("VOCAL", "vocals")]
+    charted = set()
+    for tr in mid.tracks:
+        nm = (tr.name or "").upper()
+        for key, inst in name_map:
+            if key not in nm:
+                continue
+            if inst == "vocals":
+                if any(m.type == "lyrics" for m in tr) or \
+                   any(m.type == "note_on" and m.velocity > 0 for m in tr):
+                    charted.add("vocals")
+            else:
+                # A real chart has expert gems in the 96..100 lane.
+                if any(m.type == "note_on" and m.velocity > 0 and 96 <= m.note <= 100
+                       for m in tr):
+                    charted.add(inst)
+            break
+    return charted
+
+
+def _build_dta(meta: dict, shortname: str, layout, mode: str,
+               charted: set | None = None) -> str:
     """Generate a Rock Band 3 songs.dta from song.ini metadata + the mogg channel
-    layout. `layout` = [(track_name, [ch...])] from mogg.build_mogg_from_stems."""
+    layout. `layout` = [(track_name, [ch...])] from mogg.build_mogg_from_stems.
+    `charted` limits which instruments are exposed as playable (ranked) parts;
+    audio stems for un-charted instruments stay as backing channels."""
     label = "2x Bass Pedal" if mode == "2x" else "1x Bass Pedal"
     title = (meta.get("name") or shortname).strip()
     artist = (meta.get("album_artist") or meta.get("artist") or "Unknown").strip()
@@ -109,8 +138,10 @@ def _build_dta(meta: dict, shortname: str, layout, mode: str) -> str:
     except (TypeError, ValueError):
         song_len = 0
 
-    # Channel lists.
-    inst_tracks = {"drum", "bass", "guitar", "keys", "vocals"}
+    # Only instruments that are actually charted are exposed as playable tracks.
+    # If `charted` is None (caller didn't detect), fall back to "all instruments
+    # that have a stem" (legacy behaviour).
+    inst_tracks = charted if charted is not None else {"drum", "bass", "guitar", "keys", "vocals"}
     total_ch = sum(len(idxs) for _, idxs in layout)
     cores = []
     for track, idxs in layout:
@@ -134,12 +165,16 @@ def _build_dta(meta: dict, shortname: str, layout, mode: str) -> str:
             track_lines.append(f"            ({track} ({chans}))")
     tracks_block = "\n".join(track_lines)
 
-    has_vox = any(t == "vocals" for t, _ in layout)
-    rank_band = _tier_to_rank(meta.get("diff_band", meta.get("diff_guitar")))
-    rank_g = _tier_to_rank(meta.get("diff_guitar"))
-    rank_b = _tier_to_rank(meta.get("diff_bass", meta.get("diff_guitar")))
-    rank_d = _tier_to_rank(meta.get("diff_drums"))
+    # A rank of 0 = instrument not playable. Only rank the charted instruments.
+    has_vox = "vocals" in inst_tracks
+    rank_g = _tier_to_rank(meta.get("diff_guitar")) if "guitar" in inst_tracks else 0
+    rank_b = _tier_to_rank(meta.get("diff_bass", meta.get("diff_guitar"))) if "bass" in inst_tracks else 0
+    rank_d = _tier_to_rank(meta.get("diff_drums")) if "drum" in inst_tracks else 0
     rank_v = _tier_to_rank(meta.get("diff_vocals", 0)) if has_vox else 0
+    # Band rank = average of the charted instrument ranks (RB uses this for sort).
+    _ranks = [r for r in (rank_g, rank_b, rank_d, rank_v) if r > 0]
+    rank_band = _tier_to_rank(meta.get("diff_band")) if meta.get("diff_band") \
+        else (sum(_ranks) // len(_ranks) if _ranks else 270)
 
     sid = _song_id(shortname)
     pans_s = " ".join(pans)
@@ -331,7 +366,19 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
     #    debug (unencrypted) variant, so no NPDRM klicensee is needed.
     import io as _io
     src_mid = mido.MidiFile(mid_path)
+    # a) open strums → green gem (RB3 ignores open notes)
+    src_mid, os_stats = _convert.convert_open_notes(src_mid)
+    if os_stats["converted"]:
+        log(f"    ◇ mid: {os_stats['converted']} open note(s) remapped to green\n", "info")
+    # b) bass-pedal variant on the drums kick lane
     out_mid, ks = _convert.apply_pedal_variant(src_mid, mode)
+    charted = _charted_instruments(out_mid)
+    # song.ini rarely carries song_length; derive it from the chart itself.
+    if not meta.get("song_length"):
+        try:
+            meta["song_length"] = str(int(out_mid.length * 1000))
+        except Exception:
+            pass
     _mbuf = _io.BytesIO()
     out_mid.save(file=_mbuf)
     _edat.build_debug_edat(_mbuf.getvalue(),
@@ -340,6 +387,7 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
         log(f"    ◇ mid: {ks['converted']} double-kick(s) forced to single lane\n", "info")
     else:
         log(f"    ◇ mid: {ks['removed']} double-kick(s) removed (1x playable)\n", "info")
+    log(f"    ◇ charted: {', '.join(sorted(charted)) or 'none'}\n", "info")
 
     # 2) MOGG: reuse the source mogg verbatim if present, else build one from the
     #    separate YARG/CH stems. The built layout drives the dta channel lists.
@@ -373,7 +421,7 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
             f.write(out_dta)
         log(f"    ◇ dta: patched ({mode})\n", "info")
     elif mogg_layout is not None:
-        out_dta = _build_dta(meta, shortname, mogg_layout, mode)
+        out_dta = _build_dta(meta, shortname, mogg_layout, mode, charted)
         with open(out_dta_path, "w", encoding="latin1") as f:
             f.write(out_dta)
         log(f"    ◇ dta: generated from song.ini ({mode})\n", "info")

@@ -28,6 +28,47 @@ def _is_drums_track(track: mido.MidiTrack) -> bool:
     return "DRUM" in (track.name or "").strip().upper()
 
 
+# Open (no-fret) strum markers. YARG/Clone-Hero charts use the note one below the
+# green gem of each difficulty (the "ENHANCED_OPENS" extension). Rock Band 3 has
+# no open-strum lane and silently IGNORES these notes, so the chart plays with
+# gaps. We remap each open onto its difficulty's GREEN gem so it stays playable.
+#   Easy 59→60, Medium 71→72, Hard 83→84, Expert 95→96
+OPEN_TO_GREEN = {59: 60, 71: 72, 83: 84, 95: 96}
+
+# Tracks that use the 5-fret open convention (NOT drums — there note 95 is the
+# 2x-kick, handled separately by apply_pedal_variant).
+_FRET_TRACK_KEYS = ("GUITAR", "BASS", "RHYTHM")
+
+
+def _is_fret_track(track: mido.MidiTrack) -> bool:
+    nm = (track.name or "").strip().upper()
+    return "DRUM" not in nm and any(k in nm for k in _FRET_TRACK_KEYS)
+
+
+def convert_open_notes(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
+    """Return a NEW MidiFile with open-strum notes on 5-fret tracks remapped to
+    the green gem of their difficulty (RB3 ignores open notes otherwise).
+
+    Returns (new_mid, {"converted": n}). Never mutates the input.
+    """
+    out = mido.MidiFile(type=mid.type, ticks_per_beat=mid.ticks_per_beat)
+    converted = 0
+    for track in mid.tracks:
+        new_tr = mido.MidiTrack()
+        new_tr.name = track.name
+        fret = _is_fret_track(track)
+        for msg in track:
+            if (fret and msg.type in ("note_on", "note_off")
+                    and msg.note in OPEN_TO_GREEN):
+                new_tr.append(msg.copy(note=OPEN_TO_GREEN[msg.note]))
+                if msg.type == "note_on" and msg.velocity > 0:
+                    converted += 1
+            else:
+                new_tr.append(msg.copy())
+        out.tracks.append(new_tr)
+    return out, {"converted": converted}
+
+
 def apply_pedal_variant(mid: mido.MidiFile, mode: str) -> tuple[mido.MidiFile, dict]:
     """Return a NEW MidiFile with PART DRUMS kicks adjusted for `mode`.
 
