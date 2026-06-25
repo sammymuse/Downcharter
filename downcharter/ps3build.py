@@ -164,14 +164,15 @@ _RANK_TIERS = {
 
 
 def _intensity_to_rank(intensity, instrument: str) -> int:
-    """song.ini `diff_*` intensity (0..6, or -1/None = absent) → RB3 rank number
-    for `instrument`, via that instrument's tier thresholds. Out-of-range or
-    unparseable intensities fall back to tier 3 (a sane "Moderate")."""
+    """song.ini `diff_*` intensity (0..6) → RB3 rank number for `instrument`, via
+    that instrument's tier thresholds. When the ini carries NO intensity for the
+    part (missing, -1, or unparseable) the rank is 0 — exactly what Onyx does
+    (e.g. Elegy has no diff_vocals, so vocals rank 0)."""
     tiers = _RANK_TIERS.get(instrument, _RANK_TIERS["band"])
     try:
         i = int(intensity)
     except (TypeError, ValueError):
-        return tiers[3]
+        return 0            # no intensity registered → rank 0
     if i < 0:
         return 0            # explicitly-absent part
     return tiers[min(i, 6)]
