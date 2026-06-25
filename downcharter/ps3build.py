@@ -142,12 +142,39 @@ def _song_id(shortname: str) -> int:
     return 1000000000 + (h % 900000000)
 
 
-def _tier_to_rank(tier) -> int:
-    table = {0: 1, 1: 130, 2: 200, 3: 270, 4: 350, 5: 450, 6: 600}
+# RB3 rank-tier thresholds (the Magma/C3 boundaries the game uses to turn a raw
+# `rank` number into the number of difficulty "dots" it shows). Each list is the
+# minimum rank for tiers 1..7, so a song.ini `diff_*` INTENSITY (0..6, where the
+# Intensity page maps intensity n → difficulty tier n+1) indexes straight into it.
+# These are PER-INSTRUMENT — the same intensity yields a different rank number per
+# instrument, which is exactly why one shared table mis-displayed difficulties.
+# Index 0 is 1 (not 0): in a DTA, rank 0 means "part absent", so the lowest
+# *playable* tier must be ≥1.
+_RANK_TIERS = {
+    "drum":      (1, 124, 151, 178, 242, 345, 448),
+    "guitar":    (1, 139, 176, 221, 267, 333, 409),
+    "bass":      (1, 135, 181, 228, 293, 364, 436),
+    "vocals":    (1, 132, 175, 218, 279, 353, 427),
+    "keys":      (1, 153, 211, 269, 327, 385, 443),
+    "real_keys": (1, 153, 211, 269, 327, 385, 443),
+    "real_guitar": (1, 150, 205, 264, 323, 382, 442),
+    "real_bass":   (1, 150, 208, 267, 325, 384, 442),
+    "band":      (1, 163, 215, 243, 267, 292, 345),
+}
+
+
+def _intensity_to_rank(intensity, instrument: str) -> int:
+    """song.ini `diff_*` intensity (0..6, or -1/None = absent) → RB3 rank number
+    for `instrument`, via that instrument's tier thresholds. Out-of-range or
+    unparseable intensities fall back to tier 3 (a sane "Moderate")."""
+    tiers = _RANK_TIERS.get(instrument, _RANK_TIERS["band"])
     try:
-        return table.get(int(tier), 270)
+        i = int(intensity)
     except (TypeError, ValueError):
-        return 270
+        return tiers[3]
+    if i < 0:
+        return 0            # explicitly-absent part
+    return tiers[min(i, 6)]
 
 
 def _audio_guided_spans(mid, folder: str) -> list:
@@ -306,15 +333,31 @@ def _build_dta(meta: dict, shortname: str, layout, mode: str,
     # Each diff_* in the ini is an independent 0-6 intensity — never borrow one
     # instrument's tier for another.
     has_vox = "vocals" in inst_tracks
-    rank_g = _tier_to_rank(meta.get("diff_guitar")) if "guitar" in inst_tracks else 0
-    rank_b = _tier_to_rank(meta.get("diff_bass")) if "bass" in inst_tracks else 0
-    rank_d = _tier_to_rank(meta.get("diff_drums")) if "drum" in inst_tracks else 0
-    rank_k = _tier_to_rank(meta.get("diff_keys")) if "keys" in inst_tracks else 0
-    rank_v = _tier_to_rank(meta.get("diff_vocals")) if has_vox else 0
-    # Band rank = average of the charted instrument ranks (RB uses this for sort).
-    _ranks = [r for r in (rank_g, rank_b, rank_d, rank_k, rank_v) if r > 0]
-    rank_band = _tier_to_rank(meta.get("diff_band")) if meta.get("diff_band") \
-        else (sum(_ranks) // len(_ranks) if _ranks else 270)
+    rank_g = _intensity_to_rank(meta.get("diff_guitar"), "guitar") if "guitar" in inst_tracks else 0
+    rank_b = _intensity_to_rank(meta.get("diff_bass"), "bass") if "bass" in inst_tracks else 0
+    rank_d = _intensity_to_rank(meta.get("diff_drums"), "drum") if "drum" in inst_tracks else 0
+    rank_k = _intensity_to_rank(meta.get("diff_keys"), "keys") if "keys" in inst_tracks else 0
+    rank_v = _intensity_to_rank(meta.get("diff_vocals"), "vocals") if has_vox else 0
+    # Band rank: honour an explicit diff_band intensity; otherwise derive it from
+    # the AVERAGE INTENSITY of the charted instruments (not the average of their
+    # ranks — those live on different per-instrument scales) and map through the
+    # band tier table. _intensity_to_rank returns 0 only for an explicitly-absent
+    # (-1) part, so filter those out of the average.
+    _intensities = []
+    for ini_key, inst in (("diff_guitar", "guitar"), ("diff_bass", "bass"),
+                          ("diff_drums", "drum"), ("diff_keys", "keys"),
+                          ("diff_vocals", "vocals")):
+        if inst not in inst_tracks and not (inst == "vocals" and has_vox):
+            continue
+        iv = _ini_int(meta, ini_key)
+        if iv is not None and iv >= 0:
+            _intensities.append(iv)
+    if meta.get("diff_band") not in (None, ""):
+        rank_band = _intensity_to_rank(meta.get("diff_band"), "band")
+    elif _intensities:
+        rank_band = _intensity_to_rank(round(sum(_intensities) / len(_intensities)), "band")
+    else:
+        rank_band = _RANK_TIERS["band"][3]
     has_keys = rank_k > 0
 
     sid = _song_id(shortname)
@@ -338,9 +381,13 @@ def _build_dta(meta: dict, shortname: str, layout, mode: str,
         rank_lines.append(f"      (real_keys {rank_k})")
     rank_lines.append(f"      (band {rank_band})")
     rank_block = "\n".join(rank_lines)
-    # ESRB-style content rating: 4 = "no rating supplied" (CH/YARG carries none).
+    # Content rating. song.ini (YARG) uses 1=FF 2=SR 3=MC 4=NR 5=SC; RB3's dta
+    # only has 1=FF 2=SR 3=Mature 4=No-rating. Map 1:1 for 1-4; YARG's 5 (Sensitive
+    # Content) has no RB slot → treat as Supervision Recommended (2). Default 4.
     rating = _ini_int(meta, "rating")
-    if rating is None or not (1 <= rating <= 4):
+    if rating == 5:
+        rating = 2
+    elif rating is None or not (1 <= rating <= 4):
         rating = 4
     # optional author/charter credit (RB3DX surfaces it; harmless on stock RB3).
     author_line = f'\n   (author "{charter}")' if charter else ""
