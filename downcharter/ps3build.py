@@ -29,7 +29,6 @@ import mido
 from . import milo as _milo
 from . import convert as _convert
 from . import mogg as _mogg
-from . import edat as _edat
 from . import art as _art
 from .midi_utils import build_tempo_map, tick_to_ms, to_abs
 
@@ -633,10 +632,18 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
 
     log(f"  → {pkg}\n", "info")
 
-    # 1) MIDI: pedal-variant transform → <id>.mid.edat (unencrypted debug EDAT).
-    #    RB3 only loads the chart as <id>.mid.edat; RB3DX nightly accepts the
-    #    debug (unencrypted) variant, so no NPDRM klicensee is needed.
-    import io as _io
+    # 1) MIDI: pedal-variant transform → <id>.mid.edat (DECRYPTED / plain).
+    #    The chart must live at <id>.mid.edat, but it is written as a plain,
+    #    unencrypted MIDI — NOT wrapped in an NPD/EDAT container.
+    #
+    #    Why no NPD wrapper: both readers reject/avoid it. YARG's UnpackedRBPKG
+    #    flags any .mid.edat whose first 3 bytes are "NPD" as encrypted
+    #    (ScanResult.EdatMidiEncrypted) and drops the song; otherwise it loads the
+    #    file verbatim as a MIDI. RB3DX nightly likewise reads a decrypted chart.
+    #    So a plain MIDI named .mid.edat is the format both accept ("desde que
+    #    esteja desincriptado"). The NPD debug-EDAT wrapper (downcharter/edat.py,
+    #    added in 91839e5) made YARG see the NPD magic and reject the folder — it
+    #    is intentionally no longer used on this path.
     # a) open strums → green gem (RB3 ignores open notes)
     src_mid, os_stats = _convert.convert_open_notes(src_mid)
     if os_stats["converted"]:
@@ -653,10 +660,7 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
             meta["song_length"] = str(int(out_mid.length * 1000))
         except Exception:
             pass
-    _mbuf = _io.BytesIO()
-    out_mid.save(file=_mbuf)
-    _edat.build_debug_edat(_mbuf.getvalue(),
-                           os.path.join(song_dir, f"{shortname}.mid.edat"), pkg)
+    out_mid.save(os.path.join(song_dir, f"{shortname}.mid.edat"))
     if mode == "2x":
         log(f"    ◇ mid: {ks['converted']} double-kick(s) forced to single lane\n", "info")
     else:
