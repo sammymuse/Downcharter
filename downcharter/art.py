@@ -28,18 +28,42 @@ required by audio.py).
 """
 from __future__ import annotations
 
-# 32-byte HMX header for a 256×256 DXT1 texture, taken verbatim from real
-# Onyx-produced .png_ps3 files (identical across every cover we checked).
-_HEADER_256_DXT1 = bytes([
-    0x01, 0x04, 0x08, 0x00, 0x00, 0x00, 0x04, 0x00,
-    0x01, 0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-])
+# HMX bitmap header (32 bytes), built per-resolution. The dimension fields were
+# reverse-engineered from real Onyx .png_ps3 files (256×256 → byte-identical):
+#   0      version          = 0x01
+#   1      bpp              = 0x04   (DXT1 = 4 bits/pixel)
+#   2..5   encoding (u32le) = 8      (DXT1, PS3 plain little-endian)
+#   6      mipmaps (u8)     = levels-3  (Onyx writes 4 for a 7-level 256 chain)
+#   7..8   width  (u16le)
+#   9..10  height (u16le)
+#   11..12 bytes-per-line (u16le) = width·bpp/8 = width/2
+#   13..31 zero padding
+def _hmx_header(size: int, levels: int) -> bytes:
+    h = bytearray(32)
+    h[0] = 0x01
+    h[1] = 0x04
+    h[2] = 0x08                               # encoding u32le = 8
+    h[6] = levels - 3                         # 256→4, matching Onyx
+    h[7] = size & 0xFF;  h[8] = (size >> 8) & 0xFF        # width
+    h[9] = size & 0xFF;  h[10] = (size >> 8) & 0xFF       # height
+    bpl = size // 2                           # DXT1: width·4bpp/8
+    h[11] = bpl & 0xFF;  h[12] = (bpl >> 8) & 0xFF
+    return bytes(h)
 
-# RB album art is square 256×256; mip chain goes down to the 4×4 DXT block floor.
+
+def _mip_sizes(size: int) -> tuple:
+    """Full mip chain from `size` down to the 4×4 DXT block floor."""
+    sizes = []
+    s = size
+    while s >= 4:
+        sizes.append(s)
+        s //= 2
+    return tuple(sizes)
+
+
+# RB album art is square; default 256×256 (platform standard, byte-identical to
+# Onyx). 512 is selectable (experimental) once verified in-game.
 _SIZE = 256
-_MIP_SIZES = (256, 128, 64, 32, 16, 8, 4)
 
 # Cover filenames CH / YARG songs ship.
 _COVER_NAMES = ("album.png", "album.jpg", "album.jpeg", "cover.png", "cover.jpg",
@@ -209,19 +233,25 @@ def _encode_dxt1(rgb) -> bytes:
     return bytes(out)
 
 
-def build_png_ps3(cover_path: str) -> bytes:
-    """Build a 256×256 DXT1 .png_ps3 texture (header + mip chain) from `cover_path`.
+def build_png_ps3(cover_path: str, size: int = _SIZE) -> bytes:
+    """Build a `size`×`size` DXT1 .png_ps3 texture (header + mip chain).
 
-    Raises if Pillow/numpy are unavailable or the image can't be read.
+    `size` must be a power of two (256 = platform standard / byte-identical to
+    Onyx; 512 = higher-resolution, experimental). Raises if Pillow/numpy are
+    unavailable or the image can't be read.
     """
     import numpy as np
     from PIL import Image
 
-    img = Image.open(cover_path).convert("RGB")
-    base = img.resize((_SIZE, _SIZE), Image.LANCZOS)
+    if size < 4 or (size & (size - 1)) != 0:
+        raise ValueError(f"art size must be a power of two ≥4, got {size}")
 
-    data = bytearray(_HEADER_256_DXT1)
-    for sz in _MIP_SIZES:
-        mip = base if sz == _SIZE else base.resize((sz, sz), Image.LANCZOS)
+    img = Image.open(cover_path).convert("RGB")
+    base = img.resize((size, size), Image.LANCZOS)
+
+    mip_sizes = _mip_sizes(size)
+    data = bytearray(_hmx_header(size, len(mip_sizes)))
+    for sz in mip_sizes:
+        mip = base if sz == size else base.resize((sz, sz), Image.LANCZOS)
         data += _encode_dxt1(np.asarray(mip, dtype=np.uint8))
     return bytes(data)

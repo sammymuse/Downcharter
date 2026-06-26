@@ -560,7 +560,7 @@ def source_has_double_kicks(src_folder: str) -> bool:
 
 
 # ── full PS3 song folder ───────────────────────────────────────────────────────
-def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
+def build_ps3_song(src_folder: str, mode: str, log_fn=None, art_size: int = 256) -> str:
     """Assemble a native unencrypted RPCS3 PS3 song folder from `src_folder`.
 
     `src_folder` is expected to hold a Downcharter-processed song: a plain
@@ -711,9 +711,10 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None) -> str:
         if cover and _art.available():
             try:
                 with open(art_out, "wb") as f:
-                    f.write(_art.build_png_ps3(cover))
+                    f.write(_art.build_png_ps3(cover, art_size))
                 has_art = True
-                log(f"    ◇ art: generated from {os.path.basename(cover)}\n", "info")
+                log(f"    ◇ art: generated from {os.path.basename(cover)} "
+                    f"({art_size}×{art_size})\n", "info")
             except Exception as e:
                 log(f"    ⚠ art: cover convert failed ({e}) — skipped\n", "warn")
         elif cover and not _art.available():
