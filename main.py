@@ -715,33 +715,58 @@ class App(tk.Tk):
 
         def task():
             try:
+                # The source may be a single song folder OR a parent holding many
+                # song subfolders — convert every song under it. A "song folder" is
+                # the directory of each notes.mid (same rule the Process tab uses).
+                song_dirs = sorted({os.path.dirname(m)
+                                    for m in find_midis(self._conv_folder)})
+                if not song_dirs:
+                    # No .mid found (e.g. a lone .chart, or the builder will report
+                    # what's missing); fall back to the folder as one song.
+                    song_dirs = [self._conv_folder]
+                self._log(f"  Songs: {len(song_dirs)}\n\n")
+
+                def _label(sd):
+                    return os.path.basename(sd.rstrip("/\\")) or sd
+
                 if fmt == "sng":
                     # Verbatim repackage — no pedal variants / validation / milo.
                     from downcharter.sng import build_sng_song
-                    self._log("\n")
-                    build_sng_song(self._conv_folder, self._log, out_base=out_base)
+                    for sd in song_dirs:
+                        self._log(f"  ▸ SNG: {_label(sd)}\n", "head")
+                        try:
+                            build_sng_song(sd, self._log, out_base=out_base)
+                        except Exception as e:
+                            self._log(f"  ✗ {_label(sd)}: {e}\n", "err")
                     return
+
                 from downcharter.ps3build import source_has_double_kicks
-                if pedal == "both":
-                    # Only emit a 2x build for songs that actually have doubles to
-                    # convert; otherwise the 2x build is identical to the plain 1x.
-                    if source_has_double_kicks(self._conv_folder):
-                        modes = ["1x", "2x"]
-                    else:
-                        modes = ["1x"]
-                        self._log("  (no double-kicks → 1x only)\n", "info")
-                else:
-                    modes = [pedal]
-                self._log(f"  Pedal: {', '.join(modes)}\n\n")
                 if fmt == "ps3":
                     from downcharter.ps3build import build_ps3_song
                     builder = build_ps3_song
                 else:  # xbox
                     from downcharter.stfs import build_con_song
                     builder = build_con_song
-                for mode in modes:
-                    self._log(f"  ▸ {fmt_label} ({mode})\n", "info")
-                    builder(self._conv_folder, mode, self._log, out_base=out_base)
+                for sd in song_dirs:
+                    self._log(f"  ▸ {_label(sd)}\n", "head")
+                    try:
+                        if pedal == "both":
+                            # Only emit a 2x build for songs that actually have
+                            # doubles; otherwise it is identical to the plain 1x.
+                            if source_has_double_kicks(sd):
+                                modes = ["1x", "2x"]
+                            else:
+                                modes = ["1x"]
+                                self._log("    (no double-kicks → 1x only)\n", "info")
+                        else:
+                            modes = [pedal]
+                        for mode in modes:
+                            self._log(f"    {fmt_label} ({mode})\n", "info")
+                            builder(sd, mode, self._log, out_base=out_base)
+                    except Exception as e:
+                        import traceback
+                        self._log(f"  ✗ {_label(sd)}: {e}\n", "err")
+                        self._log(traceback.format_exc(), "err")
             except Exception as e:
                 import traceback
                 self._log(f"  ✗ {e}\n", "err")

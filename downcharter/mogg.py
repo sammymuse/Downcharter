@@ -105,11 +105,23 @@ def build_mogg_from_stems(folder: str, out_path: str, log_fn=None):
 
     decoded = []
     base_sr = None
+    failed: list[str] = []
     for track, path in stems:
-        data, sr = _decode(path)
+        try:
+            data, sr = _decode(path)
+        except Exception as e:
+            # A single corrupt/truncated stem must not abort the whole song:
+            # skip it with a warning and build from whatever decodes.
+            failed.append(os.path.basename(path))
+            log(f"    ⚠ skipped unreadable audio "
+                f"{os.path.basename(path)} ({e})\n", "warn")
+            continue
         if base_sr is None:
             base_sr = sr
         decoded.append((track, data, sr))
+    if not decoded:
+        listed = ", ".join(failed) if failed else "none"
+        raise ValueError(f"no audio could be decoded (malformed/unreadable: {listed})")
 
     # Resample everything to the first stem's rate, pad to the longest length.
     resampled = [(t, _resample(d, sr, base_sr)) for (t, d, sr) in decoded]
@@ -159,5 +171,5 @@ def build_mogg_from_stems(folder: str, out_path: str, log_fn=None):
         pass
 
     log(f"    ◇ mogg: built {total_ch} channels @ {base_sr} Hz "
-        f"({len(stems)} stems)\n", "info")
+        f"({len(decoded)} stem(s))\n", "info")
     return layout
