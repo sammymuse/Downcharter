@@ -850,9 +850,18 @@ def build_pyro(sections: list[Section], drum_onsets: list[int],
     return out
 
 
-# Post-proc change cadence (beats) per tier — coarser than the light: the screen
-# filter varies a lot (professional style) but doesn't flicker as fast.
-_PP_CADENCE = {"calm": 7.0, "mid": 4.0, "high": 2.0}
+# Post-proc HOLD cadence (beats) per tier — how long a single filter is held before
+# the next change, anchored to the beat grid. Derived from the pp_study over the 20
+# official venues: real (de-duplicated) filter changes hold for ~1 bar in busy mid
+# sections and many bars in calm ones, then SWITCH FAST only inside intense walls
+# (handled by the burst path below). Sparse/ballad songs sit at ~6 pp/min, frantic
+# metalcore at ~180 — so the calm hold is deliberately long.
+_PP_CADENCE = {"calm": 12.0, "mid": 5.0, "high": 3.0}
+
+# Inside a strobe/blast wall the official venues alternate TWO filters on a fast
+# subdivision (e.g. BMTH/Dethklok flicker photocopy↔video_security every ⅓–½ beat).
+# We reproduce that as a 2-filter ping-pong on the half-beat across the wall.
+_PP_BURST_SUBDIV = 0.5   # beats between flips inside a strobe wall
 
 # Post-proc TONE bias by audio timbre (Section.warmth). The pp_study over the 20
 # official venues showed B&W/desaturated filters sit in DARK, quieter audio
@@ -874,37 +883,107 @@ def _pp_tone_pool(pool: list[str], warmth: str | None) -> list[str]:
     return sorted(pool, key=lambda p: 0 if any(k in p.lower() for k in pref) else 1)
 
 
+def _beat_len_at(tick: int, time_sig_map: list, tpb: int) -> int:
+    """Length of one beat (the time-sig denominator unit) in ticks at `tick`."""
+    num, den = 4, 4
+    for t, n, d in time_sig_map:
+        if t <= tick:
+            num, den = n, d
+        else:
+            break
+    return max(1, tpb * 4 // den)
+
+
+def _first_beat_at_or_after(start: int, time_sig_map: list, tpb: int) -> int:
+    """Snap `start` UP to the nearest downbeat-aligned beat boundary. The grid is
+    measured from the active time-signature's start tick so changes land on the
+    bar/beat the way the official venues do (their pp sit ~56% on a beat, ~32% on a
+    downbeat — and the sparse songs are ~96% on a beat)."""
+    sig_start, num, den = 0, 4, 4
+    for t, n, d in time_sig_map:
+        if t <= start:
+            sig_start, num, den = t, n, d
+        else:
+            break
+    beat = max(1, tpb * 4 // den)
+    rel = start - sig_start
+    k = (rel + beat - 1) // beat        # ceil to the next beat
+    return sig_start + k * beat
+
+
 def build_postproc(sections: list[Section], theme: dict, tpb: int,
                    time_sig_map: list,
-                   drum_onsets: list[int] | None = None) -> list[AbsEvent]:
-    """Dense professional-style post-proc: cycles the filter palette at the drums'
-    rhythm (cadence by energy, coarser than the light). Snaps to the hits."""
+                   drum_onsets: list[int] | None = None,
+                   energy_env: list | None = None,
+                   strobe_spans: list | None = None) -> list[AbsEvent]:
+    """Professional-style post-proc, placed the way the 20 official venues do it
+    (pp_study, dev/_venue_pp_study.py):
+
+      * Changes are ANCHORED TO THE BEAT GRID (not to arbitrary drum hits), so they
+        land on a beat/downbeat like the originals.
+      * A filter is HELD for a whole cadence block, long in calm sections and short
+        in intense ones (local audio energy refines the tier within a section).
+      * Inside a strobe/blast WALL, two filters PING-PONG on the half-beat — the fast
+        flicker the originals use during blast beats / tremolo walls.
+    """
     out: list[AbsEvent] = []
-    drums = sorted(drum_onsets) if drum_onsets else []
+    env = sorted(energy_env) if energy_env else None
+    walls = sorted(strobe_spans) if strobe_spans else []
+    bursted: set[int] = set()   # wall starts already given a ping-pong (once each)
     last: str | None = None
     for s in sections:
         # Pool BY SECTION TYPE (primary); fallback to the genre palette.
         palette = SECTION_PP_POOL.get(s.kind) or _section_pps(theme, s)
         # Audio-timbre tone bias (dark->desaturated, bright->bright/contrast).
         palette = _pp_tone_pool(palette, s.warmth)
-        energy = section_energy(s)
-        step = max(tpb, int(tpb * _PP_CADENCE[energy]))
-        snap_win = tpb // 2
-        t = s.start
+        if not palette:
+            continue
+        sect_energy = section_energy(s)
         i = 0
+        t = _first_beat_at_or_after(s.start, time_sig_map, tpb)
         while t < s.end:
+            beat = _beat_len_at(t, time_sig_map, tpb)
+            # Local tier: audio envelope if present, else the section's mean tier.
+            tier = _env_tier(env, t) if env else sect_energy
+
+            # ── Burst path: ONCE per strobe/blast wall, ping-pong two filters for a
+            # single bar (the fast flicker the originals use at the start of a blast),
+            # then fall through to normal holds for the rest of the wall. Bounding it
+            # to one bar keeps the density realistic — long walls otherwise explode. ──
+            wall_start = None
+            for ws, we in walls:
+                if ws <= t < we:
+                    wall_start = ws
+                    break
+            if wall_start is not None and wall_start not in bursted:
+                bursted.add(wall_start)
+                a = palette[i % len(palette)]
+                b = palette[(i + 1) % len(palette)] if len(palette) > 1 else a
+                bar = measure_ticks_at(t, time_sig_map, tpb)
+                burst_end = min(t + 2 * bar, s.end)
+                sub = max(1, int(beat * _PP_BURST_SUBDIV))
+                k = 0
+                tt = t
+                while tt < burst_end:
+                    pp = a if (k % 2 == 0) else b
+                    out.append(_txt(tt, f"[{pp}.pp]"))
+                    last = pp
+                    tt += sub
+                    k += 1
+                i += 2
+                t = burst_end
+                continue
+
+            # ── Hold path: one change on this beat, held for the cadence block ──
             pp = palette[i % len(palette)]
             if pp == last and len(palette) > 1:
                 i += 1
                 pp = palette[i % len(palette)]
-            tick = _nearest(t, drums, snap_win, floor=s.start) if drums else None
-            if tick is None:
-                tick = t
-            if tick < s.end:
-                out.append(_txt(tick, f"[{pp}.pp]"))
-                last = pp
-            t += step
+            out.append(_txt(t, f"[{pp}.pp]"))
+            last = pp
             i += 1
+            t += max(beat, int(beat * _PP_CADENCE[tier]))
+    out.sort(key=lambda e: e.abs_tick)
     return out
 
 
@@ -1910,7 +1989,8 @@ def generate_venue(events_track: list[AbsEvent], bre_spans: list[tuple[int, int]
     out += build_lighting(sections, th, tpb, time_sig_map, drum_onsets,
                           pause_spans, strobe_spans, audio_onsets=audio_onsets,
                           energy_env=energy_env, drop_ticks=drop_ticks)
-    out += build_postproc(sections, th, tpb, time_sig_map, drum_onsets)
+    out += build_postproc(sections, th, tpb, time_sig_map, drum_onsets,
+                          energy_env=energy_env, strobe_spans=strobe_spans)
     # Audio flux accents join the band accents as pyro candidates (real hits, incl.
     # audio-only ones); build_pyro still gates density/placement by energy + cap.
     pyro_accents = (sorted(set(accents or []) | set(audio_onsets))
