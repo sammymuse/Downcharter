@@ -259,6 +259,7 @@ class App(tk.Tk):
         self._do_medium      = tk.BooleanVar(value=cfg.get("medium", True))
         self._do_easy        = tk.BooleanVar(value=cfg.get("easy", True))
         self._do_venue       = tk.BooleanVar(value=cfg.get("venue", True))
+        self._do_drum_anim   = tk.BooleanVar(value=cfg.get("drum_anim", True))
         self._do_hide_bg     = tk.BooleanVar(value=cfg.get("hide_bg", False))
         self._do_lipsync     = tk.BooleanVar(value=cfg.get("lipsync", False))      # talkies
         self._do_lipsync_trk = tk.BooleanVar(value=cfg.get("lipsync_track", False))  # LIPSYNC1 viseme track
@@ -268,7 +269,7 @@ class App(tk.Tk):
         self._conv_pedal  = tk.StringVar(value=cfg.get("conv_pedal", "2x"))  # 1x | 2x | both
         # Persist whenever a toggle/slider changes
         for var in (self._threshold_ms, self._do_expert_plus, self._do_hard,
-                    self._do_medium, self._do_easy, self._do_venue,
+                    self._do_medium, self._do_easy, self._do_venue, self._do_drum_anim,
                     self._do_hide_bg, self._do_lipsync, self._do_lipsync_trk,
                     self._conv_pedal):
             var.trace_add("write", lambda *_: self._save_settings())
@@ -371,6 +372,10 @@ class App(tk.Tk):
         self._lbl("GENERATE VENUE  (camera · lights · post-proc)", body).pack(anchor="w", pady=(0, 6))
         CheckTile(body, "Venue",
                   self._do_venue, color=RED, width=360, height=28).pack(anchor="w", pady=(0, 6))
+        # Drummer limb animations (PART DRUMS 24-51) authored from the Expert gems;
+        # without them the drummer stays idle in-game. On by default.
+        CheckTile(body, "Drum animations (drummer limbs)",
+                  self._do_drum_anim, color=RED, width=360, height=28).pack(anchor="w", pady=(0, 6))
         # Hides background images in-game by renaming background.png/jpg →
         # background.bak.png/jpg (revert restores them).
         CheckTile(body, "Hide in-game background (image)",
@@ -444,6 +449,7 @@ class App(tk.Tk):
             "medium":       bool(self._do_medium.get()),
             "easy":         bool(self._do_easy.get()),
             "venue":        bool(self._do_venue.get()),
+            "drum_anim":    bool(self._do_drum_anim.get()),
             "hide_bg":      bool(self._do_hide_bg.get()),
             "lipsync":      bool(self._do_lipsync.get()),
             "lipsync_track": bool(self._do_lipsync_trk.get()),
@@ -523,6 +529,7 @@ class App(tk.Tk):
         ms    = float(self._threshold_ms.get())
         xp    = self._do_expert_plus.get()
         venue = self._do_venue.get()
+        drum_anim = self._do_drum_anim.get()
         hide_bg = self._do_hide_bg.get()
         lipsync = self._do_lipsync.get()
         lipsync_trk = self._do_lipsync_trk.get()
@@ -530,13 +537,14 @@ class App(tk.Tk):
                                   ("medium", self._do_medium),
                                   ("easy", self._do_easy)] if v.get()]
         if (not xp and not diffs and not venue and not lipsync
-                and not lipsync_trk and not hide_bg):
+                and not lipsync_trk and not hide_bg and not drum_anim):
             self._log("⚠  Nothing selected.\n", "warn"); return
 
         self._log("── PROCESS ──────────────────────────────\n", "head")
         if xp:    self._log(f"  Expert+: {1000/ms:.1f} nps\n")
         if diffs: self._log(f"  Diffs: {', '.join(diffs)}\n")
         if venue: self._log("  Venue: yes (theme from genre)\n")
+        if drum_anim: self._log("  Drum animations: yes (drummer limbs)\n")
         if hide_bg: self._log("  Hide background: yes (background.png/jpg → .bak)\n")
         if lipsync_trk: self._log("  Lipsync: yes (LIPSYNC1 viseme track from lyrics)\n")
         if lipsync: self._log("  Talkies: yes (talky vocals charted from lyrics)\n")
@@ -545,7 +553,8 @@ class App(tk.Tk):
 
         def task():
             process_folder(self._folder, diffs, xp, ms, self._log, venue, lipsync_trk,
-                           do_hide_bg=hide_bg, do_talkies=lipsync)
+                           do_hide_bg=hide_bg, do_talkies=lipsync,
+                           do_drum_anim=drum_anim)
             self.after(0, lambda: self._btn_conv.set_enabled(True))
             self.after(0, lambda: self._btn_rev.set_enabled(True))
             self._log("\n")

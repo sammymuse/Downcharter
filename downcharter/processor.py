@@ -409,6 +409,7 @@ def process_midi(
     audio_path: str | None = None,
     do_lipsync: bool = False,
     do_talkies: bool = False,
+    do_drum_anim: bool = True,
 ) -> dict:
     """
     Process a MIDI file:
@@ -794,13 +795,14 @@ def process_midi(
     # Drummer limb animations (PART DRUMS notes 24-51): RB3 needs them authored or
     # the drummer stays idle. Synthesise them HERE, into the notes.mid track, from the
     # Expert gems — NOT at conversion time. No-op if the drums track is already animated.
-    try:
-        from . import convert as _convert
-        new_mid, drum_anim_stats = _convert.generate_drum_animations(new_mid)
-        if drum_anim_stats.get("added"):
-            stats["drum_anim_events"] = drum_anim_stats["added"]
-    except Exception:
-        pass
+    if do_drum_anim:
+        try:
+            from . import convert as _convert
+            new_mid, drum_anim_stats = _convert.generate_drum_animations(new_mid)
+            if drum_anim_stats.get("added"):
+                stats["drum_anim_events"] = drum_anim_stats["added"]
+        except Exception:
+            pass
 
     # Generate talkies: for songs with lyrics, chart PART VOCALS as talky/unpitched
     # vocals (extended to the next syllable + gap). Onyx generates the lipsync itself
@@ -1152,6 +1154,7 @@ def process_folder(
     do_lipsync: bool = False,
     do_hide_bg: bool = False,
     do_talkies: bool = False,
+    do_drum_anim: bool = True,
 ) -> None:
     # Hide in-game background images (background.png/jpg → .bak) — Venue sub-option.
     if do_hide_bg:
@@ -1187,7 +1190,8 @@ def process_folder(
             if not from_chart and not os.path.exists(backup):
                 shutil.copy2(path, backup)
             s = process_midi(path, path, diffs_to_gen, do_expert_plus,
-                             threshold_ms, do_venue, None, do_lipsync, do_talkies)
+                             threshold_ms, do_venue, None, do_lipsync, do_talkies,
+                             do_drum_anim=do_drum_anim)
             modified += 1
             skipped_total += len(s.get("diffs_skipped", []))
             if s.get("venue_skipped"):
