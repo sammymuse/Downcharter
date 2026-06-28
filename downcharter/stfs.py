@@ -403,6 +403,9 @@ def build_con_song(src_folder: str, mode: str, log_fn=None, art_size: int = 512,
         log(f"    > mid: RB-safety - fixed {san['overlaps_fixed']} overlapping "
             f"note(s), removed {san['sysex_removed']} Phase Shift sysex, "
             f"{san['tap_removed']} tap marker(s)\n", "info")
+    if san.get("ps_tracks_dropped"):
+        log(f"    > mid: dropped {san['ps_tracks_dropped']} Phase-Shift-only "
+            f"track(s) (e.g. PART REAL_DRUMS_PS)\n", "info")
     # Onyx no-Magma fixups: empty overdrive (fixNotelessOD) + drum [mix] events.
     out_mid, fx = _convert.apply_rb_fixups(out_mid)
     if fx["noteless_od_removed"] or fx["drum_mix_added"]:

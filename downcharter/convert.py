@@ -709,16 +709,27 @@ def sanitize_for_rb(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
         Onyx's RB3 target) — the affected gems simply revert to strum/HOPO by
         spacing, exactly as Onyx leaves them for RB3.
 
+      * **Phase-Shift-only tracks** (any track whose name ends in ``_PS``, e.g.
+        ``PART REAL_DRUMS_PS``) — these are Clone Hero / Phase Shift extensions RB3
+        does not recognise. Onyx never emits them; shipping one can crash RB3's
+        song loader. We drop the whole track (matching Onyx's RB3 output).
+
     Never mutates the input. Returns
-    (new_mid, {"overlaps_fixed", "sysex_removed", "tap_removed"}).
+    (new_mid, {"overlaps_fixed", "sysex_removed", "tap_removed", "ps_tracks_dropped"}).
     """
     from collections import defaultdict, deque
     from .midi_utils import AbsEvent
 
     out = mido.MidiFile(type=mid.type, ticks_per_beat=mid.ticks_per_beat)
-    overlaps_fixed = sysex_removed = tap_removed = 0
+    overlaps_fixed = sysex_removed = tap_removed = ps_tracks_dropped = 0
 
     for track in mid.tracks:
+        # Drop Phase-Shift-only tracks (e.g. PART REAL_DRUMS_PS) outright — RB3
+        # can choke on a track name it doesn't know. (The standard RB pro-drums
+        # track is "PART REAL_DRUMS", with no _PS suffix, and is kept.)
+        if (track.name or "").strip().upper().endswith("_PS"):
+            ps_tracks_dropped += 1
+            continue
         abs_evts = to_abs(track)
         last_tick = abs_evts[-1].abs_tick if abs_evts else 0
         # Tap-force pitch is only meaningful on the five-fret instrument tracks.
@@ -794,7 +805,7 @@ def sanitize_for_rb(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
                                     for t, m in merged]))
 
     return out, {"overlaps_fixed": overlaps_fixed, "sysex_removed": sysex_removed,
-                 "tap_removed": tap_removed}
+                 "tap_removed": tap_removed, "ps_tracks_dropped": ps_tracks_dropped}
 
 
 # ── Onyx no-Magma fixups (PACK step only) ──────────────────────────────────────
