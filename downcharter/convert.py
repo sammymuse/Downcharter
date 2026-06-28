@@ -995,8 +995,30 @@ def _add_basic_timing(mid: mido.MidiFile) -> dict:
                     if (tr.name or "").strip().upper() == "BEAT"), None)
     has_beats = beat_tr is not None and any(
         getattr(m, "note", None) in (12, 13) for m in beat_tr)
+
+    # A BEAT track can be PRESENT but malformed: gaps where whole beats/measures
+    # are missing (we have seen authored tracks that skip 3 beats every measure in
+    # constant 4/4). RB3 needs a continuous measure grid — a gappy BEAT grid is a
+    # known crash class. Detect a defect by comparing each beat-to-beat interval to
+    # the track's own median spacing; any gap noticeably larger than the median
+    # (i.e. missing beats) flags the track for a full rebuild from the time-sig map.
+    beat_defective = False
+    if has_beats:
+        ons = []
+        t = 0
+        for m in beat_tr:
+            t += m.time
+            if m.type == "note_on" and getattr(m, "note", None) in (12, 13) \
+                    and m.velocity > 0:
+                ons.append(t)
+        if len(ons) >= 3:
+            gaps = sorted(b - a for a, b in zip(ons, ons[1:]) if b > a)
+            med = gaps[len(gaps) // 2]
+            if med > 0 and any(g > med * 1.5 for g in gaps):
+                beat_defective = True
+
     beat_added = 0
-    if not has_beats and end_tick > 0:
+    if (not has_beats or beat_defective) and end_tick > 0:
         beats = _generate_beats(mid, end_tick)
         off_gap = max(1, tpb // 8)
         evts = []
