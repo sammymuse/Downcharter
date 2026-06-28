@@ -1354,9 +1354,10 @@ def apply_rb_fixups(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
     # Cross-track fixups (after the per-track OD removal above settled phrases).
     unison_removed = _fix_partial_unisons(out)
     close_fills_removed = _remove_close_fills(out)
-    fills_extended = _extend_short_fills(out)
-    fills_removed = fills_extended["removed"]
-    fills_extended = fills_extended["extended"]
+    # Disabled: Onyx does NOT extend short fills (notes 120-124 point markers
+    # stay as 1-tick triggers). Extending them to 1 measure can crash RB3.
+    fills_extended = 0
+    fills_removed = 0
 
     # basicTiming runs late so it can add an EVENTS/BEAT track without disturbing
     # the per-track loop above (and so a freshly built BEAT track is padded by
@@ -1374,16 +1375,16 @@ def apply_rb_fixups(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
                  "music_end_added": music["music_end_added"]}
 
 
-def lead_in_pad_ticks(mid: mido.MidiFile, min_beats: float = 2.0) -> int:
+def lead_in_pad_ticks(mid: mido.MidiFile, min_beats: float = 6.0) -> int:
     """Ticks of silence to prepend so the first gem sits at least `min_beats` beats
     from the song start (Onyx `magmaPad`). RB3 needs lead-in before the first note;
     a chart starting at tick 0 (no BEAT lead-in) is rejected/can hang. Returns 0
-    when the chart already has enough lead-in."""
+    when the chart already has enough lead-in. Default 6 beats = 2.6s at 120 BPM
+    matching Onyx's magmaPad exact behaviour."""
     tpb = mid.ticks_per_beat
     first = None
     for tr in mid.tracks:
         nm = (tr.name or "").strip().upper()
-        # Only instrument/vocal PART tracks carry gems; skip BEAT/VENUE/EVENTS.
         if not nm.startswith("PART"):
             continue
         t = 0
@@ -1399,51 +1400,125 @@ def lead_in_pad_ticks(mid: mido.MidiFile, min_beats: float = 2.0) -> int:
 
 
 def pad_start(mid: mido.MidiFile, pad_ticks: int) -> mido.MidiFile:
-    """Return a NEW MidiFile with every event delayed by `pad_ticks`, with the
-    initial tempo and time-signature duplicated at tick 0 so the silent lead-in is
-    well-defined, and BEAT downbeats/upbeats filled across the lead-in. Mirrors
-    Onyx `magmaPad` (which also prepends matching silence to the audio — the caller
-    does that to the mogg). No-op when pad_ticks <= 0; never mutates the input."""
+    """Return a NEW MidiFile matching Onyx's magmaPad exact output:
+    1. Extend the first time-signature bar (4/4 → 10/4 for 6 extra beats).
+    2. Insert 120 BPM at tick 0 for the padding region.
+    3. Restore original tempo at pad_ticks (where the first note lands).
+    4. Restore original time-signature at new_num * tpb (end of the extended bar).
+    5. Fill BEAT track across the lead-in.
+    6. Shift all note/lyric/text events by pad_ticks.
+    Original tempo and time-signature events are replaced, not duplicated."""
     if pad_ticks <= 0:
         return mid
     out = mido.MidiFile(type=mid.type, ticks_per_beat=mid.ticks_per_beat)
     tpb = mid.ticks_per_beat
 
-    # Initial tempo / time-sig to anchor the silent gap at tick 0.
-    init_tempo = next((m.tempo for tr in mid.tracks for m in tr
-                       if m.type == "set_tempo"), None)
     init_ts = next(((m.numerator, m.denominator) for tr in mid.tracks for m in tr
                     if m.type == "time_signature"), (4, 4))
+    orig_num, orig_den = init_ts
+    extra_beats = pad_ticks // tpb
+    new_num = orig_num + extra_beats  # e.g. 4 + 6 = 10
 
     for track in mid.tracks:
         nm = (track.name or "").strip().upper()
         abs_evts = to_abs(track)
-        shifted = [AbsEvent_shift(e, pad_ticks) for e in abs_evts]
+        # Strip original meta events we replace from shifted events.
+        shifted = [AbsEvent_shift(e, pad_ticks) for e in abs_evts
+                   if e.msg.type not in ("set_tempo", "time_signature",
+                                          "track_name")]
+        # For BEAT: drop shifted events inside the extended bar (we generated them).
+        if nm == "BEAT":
+            extended_end = new_num * tpb
+            shifted = [e for e in shifted if e.abs_tick >= extended_end]
 
         front = []
-        # Anchor tempo/time-sig at tick 0 on whichever track originally held them.
-        if any(m.type == "set_tempo" for m in track) and init_tempo is not None:
-            front.append(_ev(0, mido.MetaMessage("set_tempo", tempo=init_tempo, time=0)))
+        # Preserve track name.
+        if track.name:
+            front.append(_ev(0, mido.MetaMessage("track_name",
+                                                 name=track.name, time=0)))
+        if any(m.type == "set_tempo" for m in track):
+            orig_tempo = next((m.tempo for m in track
+                               if m.type == "set_tempo"), 500000)
+            front.append(_ev(0, mido.MetaMessage("set_tempo", tempo=500000, time=0)))
         if any(m.type == "time_signature" for m in track):
             front.append(_ev(0, mido.MetaMessage("time_signature",
-                                                 numerator=init_ts[0],
-                                                 denominator=init_ts[1], time=0)))
-        # BEAT lead-in: fill beats across the pad so the validator sees >=2 beats.
+                                                 numerator=new_num,
+                                                 denominator=orig_den, time=0)))
+        # Restore original tempo where the first note lands.
+        if any(m.type == "set_tempo" for m in track):
+            front.append(_ev(pad_ticks, mido.MetaMessage("set_tempo",
+                                                         tempo=orig_tempo, time=0)))
+        # Restore original time-sig at the END of the extended bar.
+        if any(m.type == "time_signature" for m in track):
+            front.append(_ev(new_num * tpb, mido.MetaMessage("time_signature",
+                                                             numerator=orig_num,
+                                                             denominator=orig_den,
+                                                             time=0)))
+        # BEAT lead-in: fill beats across the extended bar.
         if nm == "BEAT":
-            num = init_ts[0]
             beat = 0
             t = 0
-            while t < pad_ticks:
-                note = 12 if (beat % max(1, num) == 0) else 13
-                front.append(_ev(t, mido.Message("note_on", note=note, velocity=100, time=0)))
+            while t < new_num * tpb:
+                note = 12 if (beat % max(1, orig_num) == 0) else 13
+                front.append(_ev(t, mido.Message("note_on", note=note,
+                                                 velocity=100, time=0)))
                 front.append(_ev(t + max(1, tpb // 8),
-                                 mido.Message("note_off", note=note, velocity=0, time=0)))
+                                 mido.Message("note_off", note=note,
+                                              velocity=0, time=0)))
                 t += tpb
                 beat += 1
         out.tracks.append(to_track(front + shifted))
     if getattr(out, "_merged_track", None) is not None:
         out._merged_track = None
     return out
+
+
+# Init-marker templates matching Onyx's edgesBRE output exactly.
+# (note, off_offset_or_None) — force markers have no note_off.
+_INIT_GUITAR = [(101, None), (96, 60), (89, None), (84, 60),
+                (77, None), (72, 60), (65, None), (60, 60)]
+_INIT_BASS   = [(102, None), (97, 60), (90, None), (84, 60),
+                (78, None), (72, 60), (66, None), (60, 60)]
+
+
+def fix_init_markers(mid: mido.MidiFile) -> mido.MidiFile:
+    """Replace the first note-on cluster in PART GUITAR / PART BASS with the
+    full set of Onyx-style init markers (force-HOPO/strum + lane notes for
+    all four difficulty levels).  Force markers stay on; lane notes get a
+    60-tick note_off.  Matches Onyx edgesBRE byte-for-byte."""
+    for track in mid.tracks:
+        nm = (track.name or "").strip().upper()
+        markers = _INIT_GUITAR if nm == "PART GUITAR" else \
+                  _INIT_BASS   if nm == "PART BASS"   else None
+        if markers is None:
+            continue
+        # Find first note_on (velocity > 0).
+        t, first = 0, None
+        for m in track:
+            t += m.time
+            if _msg_is_on(m) and _GEM_LO <= getattr(m, "note", -1) <= _GEM_HI:
+                first = t
+                break
+        if first is None:
+            continue
+        abs_evts = to_abs(track)
+        # Drop note events in a 100-tick window around the first note.
+        cleaned = [e for e in abs_evts
+                   if not (first <= e.abs_tick <= first + 100
+                           and e.msg.type in ("note_on", "note_off")
+                           and hasattr(e.msg, "note"))]
+        # Insert Onyx init markers.
+        for note, off_off in markers:
+            cleaned.append(_ev(first, mido.Message("note_on", note=note,
+                                                   velocity=96, time=0)))
+            if off_off is not None:
+                cleaned.append(_ev(first + off_off,
+                                   mido.Message("note_off", note=note,
+                                                velocity=0, time=0)))
+        new_track = to_track(cleaned)
+        new_track.name = track.name
+        mid.tracks[mid.tracks.index(track)] = new_track
+    return mid
 
 
 def _ev(tick, msg):

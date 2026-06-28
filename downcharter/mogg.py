@@ -143,7 +143,8 @@ def _decode_mogg(path: str):
     return data, sr
 
 
-def ensure_mogg_44100(src_mogg: str, out_path: str, log_fn=None) -> bool:
+def ensure_mogg_44100(src_mogg: str, out_path: str, log_fn=None,
+                      pad_seconds: float = 0.0) -> bool:
     """Copy `src_mogg` to `out_path`, re-encoding to 44.1 kHz if it isn't already.
 
     Rock Band 3's audio engine assumes 44.1 kHz and crashes at song LOAD on any
@@ -152,27 +153,46 @@ def ensure_mogg_44100(src_mogg: str, out_path: str, log_fn=None) -> bool:
     existing dta channel map stays valid) and re-encode. Encrypted moggs (version
     != 0x0A, e.g. an Onyx 0x0B) can't be decoded → copied verbatim with a warning.
 
+    `pad_seconds` prepends that much silence so the audio stays in sync with a
+    MIDI that was lead-in-padded (convert.pad_start / Onyx magmaPad).  The mogg
+    must be decodable (0x0A) for padding to work; encrypted moggs are copied
+    verbatim with a warning.
+
     Returns True if a copy/re-encode succeeded."""
     import shutil
+    import numpy as np
     log = log_fn or (lambda *a, **k: None)
+    need_pad = pad_seconds > 0.0
     try:
         decoded = _decode_mogg(src_mogg)
     except Exception as e:
         decoded = None
         log(f"    ⚠ mogg: could not inspect source ({e}) — copied verbatim\n", "warn")
     if decoded is None:
+        if need_pad:
+            log("    ⚠ mogg: cannot pad encrypted audio — left unpadded\n", "warn")
         shutil.copy2(src_mogg, out_path)
         return True
     data, sr = decoded
-    if sr == _RB3_SAMPLE_RATE:
+    # --- lead-in silence (must happen before resampling) ---
+    if need_pad:
+        pad_frames = int(round(pad_seconds * sr))
+        data = np.concatenate(
+            [np.zeros((pad_frames, data.shape[1]), "float32"), data], axis=0)
+        log(f"    ◇ mogg: prepended {pad_seconds:.3f}s lead-in silence\n", "info")
+    # --- sample-rate fix ---
+    if sr == _RB3_SAMPLE_RATE and not need_pad:
+        # Fast path: already 44.1 kHz and no padding — just copy.
         shutil.copy2(src_mogg, out_path)
         log(f"    ◇ mogg: copied ({os.path.basename(src_mogg)}, "
             f"{data.shape[1]}ch @ {sr} Hz)\n", "info")
         return True
-    log(f"    ◇ mogg: re-encoding {os.path.basename(src_mogg)} "
-        f"{sr} Hz → {_RB3_SAMPLE_RATE} Hz (RB3 requires 44.1 kHz)\n", "info")
-    res = _resample(data, sr, _RB3_SAMPLE_RATE)
-    _write_mogg(res, res.shape[1], _RB3_SAMPLE_RATE, out_path)
+    if sr != _RB3_SAMPLE_RATE:
+        log(f"    ◇ mogg: re-encoding {os.path.basename(src_mogg)} "
+            f"{sr} Hz → {_RB3_SAMPLE_RATE} Hz (RB3 requires 44.1 kHz)\n", "info")
+        data = _resample(data, sr, _RB3_SAMPLE_RATE)
+        sr = _RB3_SAMPLE_RATE
+    _write_mogg(data, data.shape[1], sr, out_path)
     return True
 
 
