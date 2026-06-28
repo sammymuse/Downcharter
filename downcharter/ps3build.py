@@ -692,6 +692,13 @@ def build_ps3_song(src_folder: str, mode: str, log_fn=None, art_size: int = 512,
             f"{'added [end]; ' if fx['end_added'] else ''}"
             f"{('generated BEAT track (%d beats)' % fx['beat_added']) if fx['beat_added'] else 'BEAT present'}\n",
             "info")
+    if fx["unison_removed"] or fx["close_fills_removed"]:
+        log(f"    ◇ mid: fixed {fx['unison_removed']} partial-unison phrase(s), "
+            f"removed {fx['close_fills_removed']} close drum fill(s)\n", "info")
+    if fx["music_start_added"] or fx["music_end_added"]:
+        log(f"    ◇ mid: added "
+            f"{'[music_start] ' if fx['music_start_added'] else ''}"
+            f"{'[music_end]' if fx['music_end_added'] else ''}\n", "info")
     # b4) Lead-in pad (Onyx magmaPad): RB3 needs >=2 beats before the first gem or
     #     it can reject/hang. We can only pad when we BUILD the mogg from stems
     #     (so matching silence is prepended); a verbatim source mogg is left as-is.

@@ -413,6 +413,13 @@ def build_con_song(src_folder: str, mode: str, log_fn=None, art_size: int = 512,
             f"{'added [end]; ' if fx['end_added'] else ''}"
             f"{('generated BEAT track (%d beats)' % fx['beat_added']) if fx['beat_added'] else 'BEAT present'}\n",
             "info")
+    if fx["unison_removed"] or fx["close_fills_removed"]:
+        log(f"    > mid: fixed {fx['unison_removed']} partial-unison phrase(s), "
+            f"removed {fx['close_fills_removed']} close drum fill(s)\n", "info")
+    if fx["music_start_added"] or fx["music_end_added"]:
+        log(f"    > mid: added "
+            f"{'[music_start] ' if fx['music_start_added'] else ''}"
+            f"{'[music_end]' if fx['music_end_added'] else ''}\n", "info")
     # Lead-in pad (magmaPad): only when building the mogg from stems.
     pad_seconds = 0.0
     if mogg_path is None:

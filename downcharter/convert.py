@@ -936,14 +936,193 @@ def _add_basic_timing(mid: mido.MidiFile) -> dict:
     return {"end_added": end_added, "beat_added": beat_added}
 
 
+# Tracks that participate in RB3 unison-overdrive bonuses. A unison is awarded
+# when 2+ of these have an overdrive phrase that starts at the SAME tick; phrases
+# that overlap but start at different ticks form an *invalid* (partial) unison.
+_UNISON_TRACKS = {"PART DRUMS", "PART BASS", "PART GUITAR", "PART KEYS"}
+# Drum fill / BRE activation lanes (all five light up together for one fill).
+_FILL_NOTES = range(120, 125)
+_CLOSE_FILL_SEC = 2.5          # Onyx `fixCloseFills`: minimum gap between fills
+_MUSIC_PAD_BEATS = 2.0         # [music_start]/[music_end] inset from start/[end]
+
+
+def _events_track(mid: mido.MidiFile) -> mido.MidiTrack:
+    """Return the EVENTS track, creating an empty one if absent."""
+    ev = next((tr for tr in mid.tracks
+               if (tr.name or "").strip().upper() == "EVENTS"), None)
+    if ev is None:
+        ev = mido.MidiTrack()
+        ev.name = "EVENTS"
+        mid.tracks.append(ev)
+    return ev
+
+
+def _add_music_events(mid: mido.MidiFile) -> dict:
+    """Onyx places ``[music_start]`` / ``[music_end]`` text markers in EVENTS when
+    missing. They bound where the backing music (and crowd) play; their absence
+    doesn't crash but makes the song outro/crowd misbehave. ``[music_start]`` goes
+    two beats in (Onyx default [1:3:000] in 4/4), ``[music_end]`` two beats before
+    ``[end]``. Run AFTER basicTiming so ``[end]`` exists. No-op when both present;
+    never adds an end marker past/at the start. Returns {"music_start_added",
+    "music_end_added"}."""
+    from .midi_utils import AbsEvent
+    tpb = mid.ticks_per_beat
+    inset = int(round(_MUSIC_PAD_BEATS * tpb))
+
+    have_start = have_end = False
+    end_tick = None
+    last = 0
+    for tr in mid.tracks:
+        t = 0
+        for m in tr:
+            t += m.time
+            if m.type == "text":
+                txt = (m.text or "").strip().lower()
+                if txt == "[music_start]":
+                    have_start = True
+                elif txt == "[music_end]":
+                    have_end = True
+                elif txt == "[end]":
+                    end_tick = t if end_tick is None else min(end_tick, t)
+        last = max(last, t)
+    if end_tick is None:
+        end_tick = last
+
+    to_add: list[AbsEvent] = []
+    start_added = end_added = 0
+    if not have_start:
+        st = min(inset, max(0, end_tick - 1))
+        to_add.append(AbsEvent(abs_tick=st,
+                      msg=mido.MetaMessage("text", text="[music_start]", time=0)))
+        start_added = 1
+    if not have_end:
+        me = end_tick - inset
+        if me > inset:          # keep it after music_start and inside the song
+            to_add.append(AbsEvent(abs_tick=me,
+                          msg=mido.MetaMessage("text", text="[music_end]", time=0)))
+            end_added = 1
+    if to_add:
+        ev = _events_track(mid)
+        ev[:] = to_track(to_abs(ev) + to_add)
+        ev.name = "EVENTS"
+    return {"music_start_added": start_added, "music_end_added": end_added}
+
+
+def _od_phrases(track) -> list[tuple[int, int, int, int]]:
+    """Overdrive (note 116) spans of a track as [(start, end, on_idx, off_idx)]
+    over its absolute-event list."""
+    spans: list[tuple[int, int, int, int]] = []
+    open_on = None
+    for i, e in enumerate(to_abs(track)):
+        n = getattr(e.msg, "note", None)
+        if n != _OVERDRIVE_NOTE:
+            continue
+        if _msg_is_on(e.msg):
+            open_on = (e.abs_tick, i)
+        elif _msg_is_off(e.msg) and open_on is not None:
+            spans.append((open_on[0], e.abs_tick, open_on[1], i))
+            open_on = None
+    return spans
+
+
+def _fix_partial_unisons(mid: mido.MidiFile) -> int:
+    """Onyx `fixPartialUnisons`: RB3 groups overlapping overdrive phrases across
+    instruments into a unison bonus, but only when they start at the SAME tick. A
+    phrase that overlaps another instrument's phrase yet starts at a different tick
+    is an invalid (partial) unison and is rejected by Magma / mishandled in-game.
+    We remove the later-starting offender of every such overlapping, misaligned
+    pair (dropping an OD phrase only loses a little star-power — never gems).
+    No-op when all overlaps are aligned. Returns phrases removed."""
+    tracks = [tr for tr in mid.tracks
+              if (tr.name or "").strip().upper() in _UNISON_TRACKS]
+    phrases = []   # (start, end, track_obj, on_idx, off_idx)
+    for tr in tracks:
+        for start, end, on_i, off_i in _od_phrases(tr):
+            phrases.append((start, end, tr, on_i, off_i))
+
+    drop_per_track: dict[int, set[int]] = {}
+    removed = 0
+    for a in range(len(phrases)):
+        sa, ea, tra, ona, offa = phrases[a]
+        for b in range(a + 1, len(phrases)):
+            sb, eb, trb, onb, offb = phrases[b]
+            if tra is trb:
+                continue
+            if sa < eb and sb < ea and sa != sb:        # overlap, misaligned
+                later_tr, later_on, later_off = (
+                    (trb, onb, offb) if sb > sa else (tra, ona, offa))
+                d = drop_per_track.setdefault(id(later_tr), set())
+                if later_on not in d:
+                    d.add(later_on); d.add(later_off); removed += 1
+    if not removed:
+        return 0
+    for tr in tracks:
+        drop = drop_per_track.get(id(tr))
+        if not drop:
+            continue
+        kept = [e for i, e in enumerate(to_abs(tr)) if i not in drop]
+        name = tr.name
+        tr[:] = to_track(kept)
+        tr.name = name
+    return removed
+
+
+def _remove_close_fills(mid: mido.MidiFile) -> int:
+    """Onyx `fixCloseFills`: drum fill activation lanes (notes 120-124) spaced less
+    than 2.5 s apart confuse RB3's fill/BRE logic. We keep the first fill and drop
+    any whose start is within 2.5 s of the previously kept fill's end. Operates on
+    PART DRUMS only. No-op when fills are well spaced. Returns fills removed."""
+    tr = next((t for t in mid.tracks
+               if (t.name or "").strip().upper() == "PART DRUMS"), None)
+    if tr is None:
+        return 0
+    # Fill spans tracked via lane 120 (all five lanes share the same span).
+    spans: list[list[int]] = []
+    open_on = None
+    for e in to_abs(tr):
+        if getattr(e.msg, "note", None) != 120:
+            continue
+        if _msg_is_on(e.msg):
+            open_on = e.abs_tick
+        elif _msg_is_off(e.msg) and open_on is not None:
+            spans.append([open_on, e.abs_tick]); open_on = None
+    if len(spans) < 2:
+        return 0
+    spans.sort()
+    tempo_map = build_tempo_map(mid)
+    tpb = mid.ticks_per_beat
+    remove_ranges: list[tuple[int, int]] = []
+    prev_end = spans[0][1]
+    for start, end in spans[1:]:
+        gap_ms = tick_to_ms(start, tempo_map, tpb) - tick_to_ms(prev_end, tempo_map, tpb)
+        if gap_ms < _CLOSE_FILL_SEC * 1000.0:
+            remove_ranges.append((start, end))      # too close → drop this fill
+        else:
+            prev_end = end
+    if not remove_ranges:
+        return 0
+    kept = []
+    for e in to_abs(tr):
+        n = getattr(e.msg, "note", None)
+        if n in _FILL_NOTES and any(s <= e.abs_tick <= en for s, en in remove_ranges):
+            continue
+        kept.append(e)
+    name = tr.name
+    tr[:] = to_track(kept)
+    tr.name = name
+    return len(remove_ranges)
+
+
 def apply_rb_fixups(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
     """Apply Onyx's no-Magma MIDI fixups that affect RB3 load/playback, returning
     a NEW MidiFile and a stats dict. Currently: ensure an EVENTS ``[end]`` marker
     and a BEAT track (`basicTiming`), remove note-less overdrive phrases
-    (`fixNotelessOD`) on every instrument track, and add missing drum `[mix]`
-    events (`drumsComplete`) on PART DRUMS. No-op where nothing needs fixing;
-    never mutates the input. The lead-in pad is handled separately (it needs the
-    mogg padded in lockstep)."""
+    (`fixNotelessOD`) on every instrument track, add missing drum `[mix]`
+    events (`drumsComplete`) on PART DRUMS, fix invalid partial unisons
+    (`fixPartialUnisons`), drop too-close drum fills (`fixCloseFills`), and add
+    `[music_start]`/`[music_end]` markers when missing. No-op where nothing needs
+    fixing; never mutates the input. The lead-in pad is handled separately (it
+    needs the mogg padded in lockstep)."""
     out = mido.MidiFile(type=mid.type, ticks_per_beat=mid.ticks_per_beat)
     for track in mid.tracks:
         new_tr = mido.MidiTrack()
@@ -963,13 +1142,22 @@ def apply_rb_fixups(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
         if nm == "PART DRUMS":
             mix_added += _add_drum_mix_events(tr)
 
-    # basicTiming runs last so it can add an EVENTS/BEAT track without disturbing
+    # Cross-track fixups (after the per-track OD removal above settled phrases).
+    unison_removed = _fix_partial_unisons(out)
+    close_fills_removed = _remove_close_fills(out)
+
+    # basicTiming runs late so it can add an EVENTS/BEAT track without disturbing
     # the per-track loop above (and so a freshly built BEAT track is padded by
-    # pad_start downstream).
+    # pad_start downstream). music markers run last — they need [end] to exist.
     timing = _add_basic_timing(out)
+    music = _add_music_events(out)
     return out, {"noteless_od_removed": od_removed, "drum_mix_added": mix_added,
                  "end_added": timing["end_added"],
-                 "beat_added": timing["beat_added"]}
+                 "beat_added": timing["beat_added"],
+                 "unison_removed": unison_removed,
+                 "close_fills_removed": close_fills_removed,
+                 "music_start_added": music["music_start_added"],
+                 "music_end_added": music["music_end_added"]}
 
 
 def lead_in_pad_ticks(mid: mido.MidiFile, min_beats: float = 2.0) -> int:
