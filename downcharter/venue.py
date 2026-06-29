@@ -1716,47 +1716,42 @@ def _camera_energy(s: Section) -> str:
         top = max(_ENERGY_LEVEL.get(t, 0) for _, _, t in s.energy_spans)
         return _LEVEL_ENERGY[top]
     return section_energy(s)
-# Order used to STAGGER which instruments soften their mood per section, so the band
-# is not a uniform wall of one mood. mood_study of the 20 official venues: the band
-# has >=2 distinct playing-moods ~43% of moments (median) — they are NOT in unison —
-# and the time-share is play 32% / intense 38% / mellow 12% (we sat at play 72% /
-# intense 0%, a flat [play] wall that reads as robotic head-nodding out of the music).
-# The rhythm section (drums/bass) holds the energy; the expressive instruments
-# (guitar/keys/vocal) soften one notch on alternating sections → organic, non-unison.
-_INST_VARY_RANK = {"drums": 0, "bass": 1, "guitar": 2, "keys": 3, "vocal": 4}
+# Official venues: non-unison comes from (1) idle instruments, (2) sub-section energy
+# variation via energy_spans, (3) different instruments in different sections — NOT from
+# a modulo-based stagger.  The old stagger artificially inflated mellow because calm
+# sections produce 100% mellow and mid sections produce 50% mellow.  With no stagger,
+# mood is purely energy-driven: calm→mellow, mid→play, high→intense.
 
 
 def _anim_state(s: Section, playing: bool, instrument: str,
-                sec_idx: int = 0) -> str:
+                sec_idx: int = 0, sec_onset_density: float = 0,
+                song_mean_density: float = 1) -> str:
     """Decide an instrument's mood marker in a section. Mood follows the section
-    energy (calm→mellow / mid→play / high→intense, full vocabulary across ALL genres
-    like the official venues), then a per-instrument stagger breaks the band unison."""
+    energy (calm→mellow / mid→play / high→intense), with onset density refinement:
+    a calm section where the instrument plays densely bumps up to play (active, not
+    resting), and a high section where the instrument plays sparsely bumps down to
+    play (present but not driving)."""
     if not playing:
         return _idle_state(s)
     if s.kind == "solo" and _solo_instrument(s.name) == instrument:
         return "[play_solo]"
-    return _mood_for_level(_ENERGY_LEVEL[section_energy(s)], instrument, sec_idx)
+    return _mood_for_level(_ENERGY_LEVEL[section_energy(s)], instrument, sec_idx,
+                           sec_onset_density, song_mean_density)
 
 
-def _mood_for_level(level: int, instrument: str, sec_idx: int) -> str:
-    """Map an energy level (0/1/2) to a mood marker, with the per-instrument stagger.
-    Stagger: soften instruments one notch on alternating sections so the band isn't a
-    single mood (official median ~43% of moments NOT in unison). This also pulls the
-    over-used [play] share down toward the official ~23%.
-
-    Official distribution (20 songs): intense 27.3% / play 22.8% / mellow 18.1%.
-    The stagger allows instruments to be one notch BEHIND the local energy tier,
-    creating organic non-unison (a calm guitar in a loud section, etc.)."""
-    rank = _INST_VARY_RANK.get(instrument, 2)
-    staggered = level
-    # Stagger applies to ALL instruments but with different frequency:
-    # - Rhythm section (drums/bass, rank 0-1): stagger on even sections
-    # - Expressive (guitar/keys/vocal, rank 2-4): stagger on odd sections
-    # This creates ~40% non-unison moments, matching the official venues.
-    if level > 0 and (sec_idx + rank) % 2 == 0:
-        staggered -= 1
-    # Clamp to valid range [0, 2] but allow stagger to go BELOW the local tier
-    return f"[{_MOOD_LADDER[max(0, min(staggered, 2))]}]"
+def _mood_for_level(level: int, instrument: str, sec_idx: int,
+                     sec_density: float = 0, song_mean_density: float = 1) -> str:
+    """Map an energy level (0/1/2) to a mood marker, with onset-density refinement.
+    Density ratio = section density / song mean.  Dense calm → bump up to play;
+    sparse high → bump down to play.  Non-unison comes from idle instruments and
+    density variation, not a modulo stagger."""
+    if sec_density > 0 and song_mean_density > 0:
+        ratio = sec_density / max(song_mean_density, 0.01)
+        if level == 0 and ratio > 1.2:
+            level = 1
+        elif level == 2 and ratio < 0.6:
+            level = 1
+    return f"[{_MOOD_LADDER[max(0, min(level, 2))]}]"
 
 
 def build_animations(part_onsets: list[int], sections: list[Section],
@@ -1770,6 +1765,17 @@ def build_animations(part_onsets: list[int], sections: list[Section],
     floor = onsets[0]
     eighth = max(1, tpb // 2)
     last_onset = onsets[-1]
+
+    # Compute onset density (onsets per beat) for mood refinement.
+    # Song-wide mean density gives a baseline; each section's density vs the mean
+    # drives the calm→play / high→play bump.  MIDI-derived, song-relative.
+    total_beats = max(1.0, (last_onset - floor) / tpb)
+    song_mean_density = len(onsets) / total_beats  # onsets/beat
+
+    def _sec_density(sec_start: int, sec_end: int) -> float:
+        n = _count_onsets(onsets, sec_start, sec_end)
+        beats = max(1.0, (sec_end - sec_start) / tpb)
+        return n / beats
 
     timeline: list[tuple[int, str]] = []
     import bisect
@@ -1821,7 +1827,8 @@ def build_animations(part_onsets: list[int], sections: list[Section],
                 tick = _anchor(on, i == 0 and j == 0, cur_level)
                 if _in_idle(tick):
                     continue
-                timeline.append((tick, _mood_for_level(cur_level, instrument, i)))
+                timeline.append((tick, _mood_for_level(cur_level, instrument, i,
+                                  _sec_density(a, b), song_mean_density)))
         elif playing:
             on = _first_onset_in(s.start, s.end)
             cur_level = _ENERGY_LEVEL[section_energy(s)]
@@ -1832,7 +1839,8 @@ def build_animations(part_onsets: list[int], sections: list[Section],
             else:
                 tick = max(s.start - eighth, floor)
             if not _in_idle(tick):
-                timeline.append((tick, _anim_state(s, playing, instrument, i)))
+                timeline.append((tick, _anim_state(s, playing, instrument, i,
+                                  _sec_density(s.start, s.end), song_mean_density)))
 
     # Emit idle markers at the computed ticks
     for it in sorted(idle_ticks):
