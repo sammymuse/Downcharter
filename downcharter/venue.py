@@ -1745,7 +1745,8 @@ def build_animations(part_onsets: list[int], sections: list[Section],
     if not sections:
         return [_txt(0, "[idle_realtime]")]
     floor = onsets[0]
-    eighth = max(1, tpb // 2)
+    # quarter note (1 beat) offset for anchor/idle placement
+    quarter = max(1, tpb // 2)
     last_onset = onsets[-1]
 
     # Compute onset density (onsets per beat) for mood refinement.
@@ -1769,7 +1770,7 @@ def build_animations(part_onsets: list[int], sections: list[Section],
     def _anchor(on: int, first: bool, cur_level: int) -> int:
         if first:
             return max(s.start, floor)
-        cand = on - eighth
+        cand = on - quarter
         if cand < floor:
             return floor
         sec = _section_at(sections, cand)
@@ -1792,7 +1793,7 @@ def build_animations(part_onsets: list[int], sections: list[Section],
                   else dt_measures)
         if b - a >= thresh * mt:
             idle_ranges.append((a, b))
-            idle_ticks.add(a + eighth)
+            idle_ticks.add(a + quarter)
 
     def _in_idle(tick: int) -> bool:
         return any(a < tick < b for a, b in idle_ranges)
@@ -1800,17 +1801,22 @@ def build_animations(part_onsets: list[int], sections: list[Section],
     for i, s in enumerate(sections):
         playing = _count_onsets(onsets, s.start, s.end) > 0
         solo = s.kind == "solo" and _solo_instrument(s.name) == instrument
-        if playing and not solo and s.energy_spans:
+        if playing and s.energy_spans:
             for j, (a, b, tier) in enumerate(s.energy_spans):
                 on = _first_onset_in(a, b)
                 if on is None:
                     continue
-                cur_level = _ENERGY_LEVEL[tier]
-                tick = _anchor(on, i == 0 and j == 0, cur_level)
+                if solo:
+                    mood = "[play_solo]"
+                else:
+                    cur_level = _ENERGY_LEVEL[tier]
+                    mood = _mood_for_level(cur_level, instrument, i,
+                                           _sec_density(a, b), song_mean_density)
+                tick = _anchor(on, i == 0 and j == 0,
+                               _ENERGY_LEVEL[tier])
                 if _in_idle(tick):
                     continue
-                timeline.append((tick, _mood_for_level(cur_level, instrument, i,
-                                  _sec_density(a, b), song_mean_density)))
+                timeline.append((tick, mood))
         elif playing:
             on = _first_onset_in(s.start, s.end)
             cur_level = _ENERGY_LEVEL[section_energy(s)]
@@ -1819,7 +1825,7 @@ def build_animations(part_onsets: list[int], sections: list[Section],
             elif on:
                 tick = _anchor(on, False, cur_level)
             else:
-                tick = max(s.start - eighth, floor)
+                tick = max(s.start - quarter, floor)
             if not _in_idle(tick):
                 timeline.append((tick, _anim_state(s, instrument, i,
                                   _sec_density(s.start, s.end), song_mean_density)))
@@ -1831,12 +1837,12 @@ def build_animations(part_onsets: list[int], sections: list[Section],
     # Boundary idle markers: [idle_realtime] at song start and end.
     if sections:
         first_sec = sections[0]
-        if first_sec.kind in ("intro", "default") or floor > first_sec.start + eighth:
+        if first_sec.kind in ("intro", "default") or floor > first_sec.start + quarter:
             timeline.insert(0, (0, "[idle_realtime]"))
         last_sec = sections[-1]
         song_end = last_sec.end
-        if last_onset + 2 * eighth < song_end:
-            timeline.append((last_onset + 2 * eighth, "[idle_realtime]"))
+        if last_onset + 2 * quarter < song_end:
+            timeline.append((last_onset + 2 * quarter, "[idle_realtime]"))
 
     timeline.sort(key=lambda x: x[0])
     out: list[AbsEvent] = []
