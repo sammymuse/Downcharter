@@ -1642,6 +1642,18 @@ def _part_instrument(track_name: str) -> str | None:
     return None
 
 
+# Main PART track names per instrument — variant tracks (REAL_*, *_ANIM_*,
+# *_E/_M/_H/_X) don't carry mood markers in the official venues.
+_MAIN_PART = {
+    "PART GUITAR", "PART BASS", "PART DRUMS", "PART KEYS", "PART VOCALS",
+}
+
+
+def _is_main_part_track(track_name: str) -> bool:
+    """True if this is the primary playable PART track (not a variant)."""
+    return track_name.strip() in _MAIN_PART
+
+
 def _section_at(sections: list[Section], tick: int) -> Section | None:
     for s in sections:
         if s.start <= tick < s.end:
@@ -1924,6 +1936,11 @@ def generate_animations(part_onsets_by_track: dict[str, list[int]],
     for tname, onsets in part_onsets_by_track.items():
         inst = _part_instrument(tname)
         if inst is None:
+            continue
+        # Only animate the MAIN PART track per instrument. Variant tracks
+        # (PART REAL_*, PART *_ANIM_*) don't carry mood markers in the
+        # official venues — generating for all variants inflates counts ~5x.
+        if not _is_main_part_track(tname):
             continue
         markers = build_animations(onsets, sections, tpb,
                                    time_sig_map, inst)

@@ -583,7 +583,11 @@ def section_energy_scores(paths, sections, tempo_map, tpb: int,
 
 def section_energy_subspans(paths, sections, tempo_map, tpb: int,
                             hop_s: float = 0.1, smooth_s: float = 0.5,
-                            min_span_s: float = 3.0, heavy_gate: float = 0.5):
+                            min_span_s: float = 3.0, heavy_gate: float = 0.5,
+                            onsets: list[int] | None = None,
+                            subspan_alpha: float = 1.0,
+                            calm_thresh: float = 0.40,
+                            high_thresh: float = 0.45):
     """Per-section SUB-SPANS of energy tier, following the music WITHIN a section.
     Instead of one mean tier per section (which washes out a chorus that starts calm
     and builds, and collapses a compressed song to all-'mid'), this segments the
@@ -637,7 +641,39 @@ def section_energy_subspans(paths, sections, tempo_map, tpb: int,
         heavy = np.convolve(heavy, np.ones(w) / w, mode="same")
     if w > 1:
         env = np.convolve(env, np.ones(w) / w, mode="same")
-    tier = np.where(env < 0.40, 0, np.where(env < 0.45, 1, 2)).astype(int)
+    # ── MIDI onset density blend ─────────────────────────────────────────
+    # When onset ticks are provided, compute per-frame onset density
+    # (onsets in a 2-beat window around each frame) and blend with the
+    # audio envelope: combined = alpha * env + (1-alpha) * midi_density.
+    # This lets MIDI fill in the mid zone that audio can't separate.
+    if onsets and len(onsets) > 1:
+        # Convert onset ticks to seconds for alignment with frames
+        onset_s = np.array([tick_to_ms(t, tempo_map, tpb) / 1000.0
+                            for t in onsets])
+        n_frames = len(env)
+        # 2-beat window in seconds (average ~0.5s at 120 BPM)
+        avg_beat_s = (tick_to_ms(sections[-1].end, tempo_map, tpb)
+                      - tick_to_ms(sections[0].start, tempo_map, tpb)) / 1000.0
+        avg_beats_total = max(1, (sections[-1].end - sections[0].start) / tpb)
+        beat_s = avg_beat_s / avg_beats_total if avg_beats_total > 0 else 0.5
+        win_s = 2.0 * beat_s
+        # Vectorized: compute density for each frame using searchsorted on arrays
+        frame_times = np.arange(n_frames) * stft_s
+        # For each frame, count onsets in [t - win_s/2, t + win_s/2]
+        lo = frame_times - win_s / 2
+        hi = frame_times + win_s / 2
+        # searchsorted gives indices; difference counts onsets in window
+        idx_lo = np.searchsorted(onset_s, lo, side="left")
+        idx_hi = np.searchsorted(onset_s, hi, side="right")
+        midi_env = (idx_hi - idx_lo).astype("float64")
+        # Normalize song-relative (rank01)
+        order = np.argsort(midi_env)
+        rank = np.empty_like(order, dtype="float64")
+        rank[order] = np.linspace(0, 1, len(order))
+        midi_env = rank
+        # Blend
+        env = subspan_alpha * env + (1.0 - subspan_alpha) * midi_env
+    tier = np.where(env < calm_thresh, 0, np.where(env < high_thresh, 1, 2)).astype(int)
     min_frames = max(1, int(round(min_span_s / stft_s)))
     names = ("calm", "mid", "high")
     out: list[list[tuple[int, int, str]]] = []

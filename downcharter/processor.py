@@ -141,7 +141,9 @@ def _apply_audio_energy(folder: str, sections, tempo_map, tpb: int,
             au = _audio.section_energy_scores(paths, sections, tempo_map, tpb)
             # Per-section sub-spans so character moods follow the music WITHIN a
             # section (calm intro that builds) instead of one mood per section.
-            spans = _audio.section_energy_subspans(paths, sections, tempo_map, tpb)
+            all_onsets = sorted(set(t for ons in part_onsets.values() for t in ons))
+            spans = _audio.section_energy_subspans(paths, sections, tempo_map, tpb,
+                                                   onsets=all_onsets)
             if spans is not None:
                 for s, sp in zip(sections, spans):
                     s.energy_spans = sp
