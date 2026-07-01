@@ -340,38 +340,40 @@ def detect_stagedive(sections: list[Section], inst_onsets: dict[str, list[int]] 
 #  NEW DETECTORS (data-driven, 100-song analysis)
 # ══════════════════════════════════════════════════════════════════════════
 
-# Section-kind → entry cut type (from 100-song data: section kind determines type,
-# not instrument leader, because 75-85% of instruments play during any cut).
+# Section-kind → entry cut type, data-driven from 100 songs (2997 cuts).
+# Key principle: section kind determines type, not instrument leader.
+# Percentages shown are of ALL cuts in that section (entry+close+middle).
 _SECTION_ENTRY_CUTS: dict[str, list[str]] = {
-    "verse":      ["D_Vox_Cam_PT", "D_Vox_CLS"],
-    "prechorus":  ["D_Vox_Cam_PT", "D_Vox_CLS"],
-    "chorus":     ["D_All_Cam", "D_Vox_Cam_PT"],
-    "solo":       ["D_Gtr_Cam_PR", "D_Gtr_CLS"],
-    "build":      ["D_All_LT", "D_All_Cam"],
-    "breakdown":  ["D_Gtr_CLS", "D_Drums_LT"],
-    "drop":       ["D_All_LT", "D_All_Cam"],
-    "outro":      ["D_All_Cam", "D_All_Yeah"],
-    "intro":      ["D_All_Cam", "D_Drums_LT"],
-    "bridge":     ["D_Vox_Cam_PT", "D_Keys_Cam"],
-    "postchorus": ["D_All_Cam", "D_Vox_Cam_PT"],
-    "riff":       ["D_Gtr_CLS", "D_Bass_CLS"],
+    "verse":      ["D_Vox_Cam_PT", "D_Vocals"],       # Vox_PT 3.2%, Vocals 2.1%
+    "prechorus":  ["D_Vox_Cam_PT", "D_Drums_LT"],     # Vox_PT 4.6%, Drums_LT 2.3%
+    "chorus":     ["D_All", "D_All_Cam"],              # All 5.5%, All_Cam 3.7%
+    "solo":       ["D_Gtr_Cam_PT", "D_Gtr_CLS"],      # Gtr_PT 6.2%, Gtr_CLS 3.4%
+    "build":      ["D_Crowd_Gtr", "D_Vox_Cam_PT"],    # Crowd 6.7%, Vox_PT 4.4%
+    "breakdown":  ["D_All", "D_Vox_Cam_PT"],           # All 3.2%, Vox_PT 2.4%
+    "drop":       ["D_All_LT", "D_All_Cam"],           # (rare, data sparse)
+    "outro":      ["D_Vocals", "D_All_Cam"],           # Vocals 3.4%, All_Cam 3.4%
+    "intro":      ["D_Drums_LT", "D_Gtr_CLS"],         # Drums_LT 6.8%, Gtr_CLS 5.2%
+    "bridge":     ["D_Duo_GB", "D_Drums_LT"],          # Duo_GB 4.8%, Drums_LT 3.2%
+    "postchorus": ["D_All_Yeah", "D_All_Cam"],         # All_Yeah 4.1%, All_Cam 2.7%
+    "riff":       ["D_Bass", "D_Gtr"],                 # Bass 6.0%, Gtr 3.7%
     "default":    ["D_Vox_Cam_PT"],
 }
 
-# Section-kind → close cut type (last quartile, b16+) — 27% of cuts are here.
+# Section-kind → close cut type (last quartile, b16+).
 _SECTION_CLOSE_CUTS: dict[str, list[str]] = {
-    "verse":      ["D_Vox_CLS", "D_Vox_Cam_PT"],
-    "prechorus":  ["D_All_Cam", "D_Vox_CLS"],
-    "chorus":     ["D_All_LT", "D_All_Cam"],
-    "solo":       ["D_Gtr_CLS", "D_Drums_LT"],
-    "build":      ["D_Crowd_Gtr", "D_All_Cam"],
-    "breakdown":  ["D_Gtr_CLS", "D_Drums_LT"],
+    "verse":      ["D_Vox_Cam_PT", "D_Drums_LT"],     # Vox_PT 9.8%, Drums_LT 3.9%
+    "prechorus":  ["D_Vox_Cam_PT", "D_Bass"],          # Vox_PT 11.5%, Bass 3.4%
+    "chorus":     ["D_Vox_Cam_PT", "D_Drums_LT"],      # Vox_PT 4.2%, Drums_LT 3.8%
+    "solo":       ["D_Drums_LT", "D_Gtr_CLS"],         # Drums_LT 6.7%, Gtr_CLS 5.1%
+    "build":      ["D_Drums_LT", "D_Gtr_CLS"],         # Drums_LT 2.2%, Gtr_CLS 2.2%
+    "breakdown":  ["D_Vox_Cam_PT", "D_Drums_LT"],      # Vox_PT 4.8%, Drums_LT 4.8%
     "drop":       ["D_All_LT", "D_All_Cam"],
-    "outro":      ["D_All_Yeah", "D_All_Cam"],
-    "bridge":     ["D_Vox_CLS", "D_Keys_Cam"],
-    "postchorus": ["D_All_Cam", "D_Vox_CLS"],
-    "riff":       ["D_Gtr_CLS", "D_Bass_CLS"],
-    "default":    ["D_Vox_CLS"],
+    "outro":      ["D_Drums_LT", "D_Drums_Point"],     # Drums_LT 2.5%, Drums_Point 2.0%
+    "intro":      ["D_Drums_LT", "D_Drums_KD"],        # Drums_LT 8.4%, Drums_KD 3.1%
+    "bridge":     ["D_Drums_LT", "D_Bass_CLS"],        # Drums_LT 3.2%, Bass_CLS 2.4%
+    "postchorus": ["D_Drums_LT", "D_Gtr_CLS"],         # Drums_LT 11.0%, Gtr_CLS 5.5%
+    "riff":       ["D_Gtr_CLS", "D_Drums_LT"],         # Gtr_CLS 5.2%, Drums_LT 5.2%
+    "default":    ["D_Vox_Cam_PT"],
 }
 
 
@@ -557,23 +559,23 @@ def detect_events(sections: list[Section],
 def _cluster_limit(events: list[CutEvent],
                    sections: list[Section],
                    tpb: int) -> list[CutEvent]:
-    """Keep at most 2 distinct tick positions per section, max 2 events per tick.
+    """Keep at most 2 distinct tick positions per section, max 1 event per tick.
 
-    Official data: cuts come in clusters (50.6% ≤1 beat gap, avg 2-3 per cluster)
-    with large gaps (33.4% >8 beats)."""
+    Official data: 1.31 events/section avg. Our detectors over-generate (entry +
+    close + duos + impacts = 3-4 events/section). Limiting to 1 per tick keeps
+    the BEST cut at each position, matching official density."""
     kept = [True] * len(events)
     for s in sections:
-        # Gather indices + group by tick
         buckets: dict[int, list[int]] = {}
         for i, e in enumerate(events):
             if s.start <= e.tick < s.end:
                 buckets.setdefault(e.tick, []).append(i)
         if not buckets:
             continue
-        # Within each tick, keep top 2 by priority
+        # Within each tick, keep top 1 by priority
         for tick, idxs in buckets.items():
             idxs.sort(key=lambda i: -events[i].priority)
-            for i in idxs[2:]:
+            for i in idxs[1:]:
                 kept[i] = False
         # If more than 2 distinct ticks, keep top 2 by summed priority
         if len(buckets) > 2:
