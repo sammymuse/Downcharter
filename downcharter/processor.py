@@ -661,6 +661,7 @@ def process_midi(
         energy_env = None
         audio_strobe = None
         drop_ticks = None
+        band_activity: dict[str, list[int]] = {}
         if _audio.available() and a_paths:
             if not drum_onsets:                       # Layer 1
                 pd = _audio.percussive_onset_ticks(a_paths, tempo_map, tpb)
@@ -701,6 +702,14 @@ def process_midi(
                     a_paths, sections, tempo_map, tpb)
                 if drop_ticks:
                     stats["audio_blackout_calm"] = len(drop_ticks)
+            # Audio band activity for camera identity refinement
+            band_activity = {}
+            for band in ("bass", "drums", "lead"):
+                ba = _audio.band_activity_ticks(a_paths, tempo_map, tpb, band)
+                if ba:
+                    band_activity[band] = ba
+            if band_activity:
+                stats["audio_band_activity"] = list(band_activity.keys())
             # Character ANIMATION from the audio: ONLY vocals. Animating an ABSENT
             # bass/guitar/drums/keys creates a PART track with no charted gems —
             # RB3 doesn't render the character (camera/animation pointing at nothing)
@@ -733,7 +742,7 @@ def process_midi(
                 inst_onsets=inst_onsets, n_harm=n_harm, fill_onsets=fill_onsets,
                 dbass_onsets=dbass_onsets, audio_onsets=audio_accents,
                 energy_env=energy_env, audio_strobe_spans=audio_strobe,
-                drop_ticks=drop_ticks)
+                drop_ticks=drop_ticks, band_activity=band_activity)
             new_mid.tracks.append(build_venue_track(venue_events))
             stats["venue_events"] = len(venue_events)
             stats["venue_theme"] = theme

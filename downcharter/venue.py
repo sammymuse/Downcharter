@@ -1861,7 +1861,8 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
                  onsets: list[int] | None = None,
                  inst_onsets: dict[str, list[int]] | None = None,
                  audio_onsets: list[int] | None = None,
-                 energy_env: list[tuple[int, str]] | None = None) -> list[AbsEvent]:
+                 energy_env: list[tuple[int, str]] | None = None,
+                 band_activity: dict[str, list[int]] | None = None) -> list[AbsEvent]:
     """Places camera cuts at the rate of SECTION_PACE_S (× the theme's pace_scale),
     cycling the section pool without repeating the previous cut. Injects D_BRE on BREs.
     If `accents` is given, snaps each cut to the nearest musical accent (±1 beat) —
@@ -1992,7 +1993,8 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
     # context (_NP if idle, None if it makes no sense). Full-band cuts are throttled to
     # `fullband_gap`; one stage dive per song; anti-recency on the rest.
     events = detect_events(sections, inst_onsets, accents, bre_spans, time_sig_map, tpb,
-                            energy_env=energy_env)
+                           audio_onsets=audio_onsets, energy_env=energy_env,
+                           band_activity=band_activity)
     events.sort(key=lambda e: (e.tick, -e.priority))
     accepted: list[tuple[int, str]] = []
     recent_dir: deque = deque(maxlen=4)
@@ -2536,7 +2538,8 @@ def generate_venue(events_track: list[AbsEvent], bre_spans: list[tuple[int, int]
                    audio_onsets: list[int] | None = None,
                     energy_env: list[tuple[int, str]] | None = None,
                     audio_strobe_spans: list[tuple[int, int]] | None = None,
-                    drop_ticks: list[int] | None = None) -> list[AbsEvent]:
+                    drop_ticks: list[int] | None = None,
+                    band_activity: dict[str, list[int]] | None = None) -> list[AbsEvent]:
     """Generate all the text events of an explicit VENUE, sorted by tick.
     `theme` is the THEMES key (derived from the genre via genre_to_theme).
     `accents` (ticks of the Expert accents) syncs the cuts with the music.
@@ -2574,7 +2577,7 @@ def generate_venue(events_track: list[AbsEvent], bre_spans: list[tuple[int, int]
     out += build_camera(sections, tempo_map, time_sig_map, tpb, bre_spans,
                         pace_scale=th["pace"], accents=accents, onsets=onsets,
                         inst_onsets=inst_onsets, audio_onsets=audio_onsets,
-                        energy_env=energy_env)
+                        energy_env=energy_env, band_activity=band_activity)
     if inst_onsets:
         out += build_spotlights(sections, inst_onsets, tpb)
         # Sing-along only with REAL vocals (chart/lyrics), never with the audio proxy.

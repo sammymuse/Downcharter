@@ -352,7 +352,8 @@ def detect_events(sections: list[Section],
                   bre_spans: list[tuple[int, int]] | None,
                   time_sig_map: list, tpb: int,
                   audio_onsets: list[int] | None = None,
-                  energy_env: list[tuple[int, str]] | None = None) -> list[CutEvent]:
+                  energy_env: list[tuple[int, str]] | None = None,
+                  band_activity: dict[str, list[int]] | None = None) -> list[CutEvent]:
     """Full event timeline. Sorted by tick (ties broken by priority desc)."""
     acc = sorted(accents) if accents else []
     # Merge MIDI + audio accents for richer snap
@@ -378,7 +379,8 @@ def detect_events(sections: list[Section],
     ev += detect_energy_transitions(sections, energy_env, acc, tpb)
     ev += detect_solos(sections, inst_onsets, acc, tpb)
     ev += detect_baseline_cuts(sections, inst_onsets, acc, time_sig_map, tpb,
-                               audio_onsets=audio_onsets)
+                                audio_onsets=audio_onsets,
+                                band_activity=band_activity)
     ev.sort(key=lambda e: (e.tick, -e.priority))
     return ev
 
@@ -387,7 +389,9 @@ def detect_baseline_cuts(sections: list[Section],
                          inst_onsets: dict[str, list[int]] | None,
                          accents: list[int] | None,
                          time_sig_map: list, tpb: int,
-                         audio_onsets: list[int] | None = None) -> list[CutEvent]:
+                         audio_onsets: list[int] | None = None,
+                         band_activity: dict[str, list[int]] | None = None
+                         ) -> list[CutEvent]:
     """One structural directed cut per qualifying section (mid/high energy).
 
     3 categories:
@@ -418,6 +422,28 @@ def detect_baseline_cuts(sections: list[Section],
                 merged.append(acc[i]); i += 1; j += 1
         merged.extend(acc[i:]); merged.extend(audio[j:])
         acc = merged
+
+    # Pre-compute audio band activity lookup for identity refinement
+    # band_activity = {"bass": [tick, ...], "drums": [...], "lead": [...]}
+    # 'lead' ≈ guitar/vocals (300-3000Hz)
+    def _active_band_at(tick: int) -> str | None:
+        """Which frequency band is most active near `tick` (±1 beat)."""
+        if not band_activity:
+            return None
+        import bisect
+        best_band, best_cnt = None, 0
+        for band, ticks in band_activity.items():
+            if not ticks:
+                continue
+            i = bisect.bisect_left(ticks, tick)
+            cnt = 0
+            for ci in (i - 1, i):
+                if 0 <= ci < len(ticks) and abs(ticks[ci] - tick) <= tpb:
+                    cnt += 1
+            if cnt > best_cnt:
+                best_band, best_cnt = band, cnt
+        return best_band
+
     for s in sections:
         if _RANK[_camera_energy(s)] < 1:  # skip calm sections
             continue
@@ -441,8 +467,21 @@ def detect_baseline_cuts(sections: list[Section],
         tick = (_busiest_onset(lead_ons, s.start, s.end, tpb, mid)
                 if lead_ons else mid)
         tick = _nearest_accent(tick, acc, tpb) if acc else tick
-        out.append(CutEvent(tick, "baseline", cuts, 30,
-                            note=f"structural {lead}@{s.kind}"))
+        # Audio band activity can ADD a secondary cut option
+        audio_band = _active_band_at(tick)
+        final_cuts = list(cuts)
+        if audio_band is not None:
+            # Map audio band to appropriate cut
+            band_cut = {
+                "bass": "D_Bass_CLS",
+                "drums": "D_Drums_LT",
+                "lead": "D_Vox_Cam_PT",  # lead ≈ vocal/guitar
+            }.get(audio_band)
+            if band_cut and band_cut not in final_cuts:
+                final_cuts.append(band_cut)
+        out.append(CutEvent(tick, "baseline", final_cuts, 30,
+                            note=f"structural {lead}@{s.kind}" +
+                            (f" audio={audio_band}" if audio_band else "")))
     return out
 
 
