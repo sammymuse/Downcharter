@@ -1404,6 +1404,38 @@ _CAMERA_MARKOV: dict[str, dict[str, float]] = {
     "V_Near": {"D_Near": 90, "B_Near": 77, "B_Hand": 67, "V_Closeup": 60, "BG_Near": 58, "Front_Near": 58, "G_Near": 54, "D_Hand": 51, "BV_Near": 49, "BD_Near": 47, "G_Hand": 46, "Front_Behind": 44, "BK_Near": 43, "All_Behind": 42, "GK_Near": 42},
 }
 
+# Camera cut levels from Onyx VenueGen (0=wide, 8=most specific).
+# Transitions must go DOWN in level (or stay at 0), never up.
+# This prevents jumping from a key closeup directly to a guitar closeup
+# without going through a wider shot first.
+_CAMERA_LEVELS: dict[str, int] = {
+    # Nível 8 — Keys (mais específicos)
+    "K_Near": 8, "K_Behind": 8, "K_Head": 8, "K_Hand": 8,
+    # Nível 7 — Guitar + Keys
+    "GK_Near": 7, "GK_Behind": 7,
+    # Nível 6 — Bass + Keys
+    "BK_Near": 6, "BK_Behind": 6,
+    # Nível 5 — Bass + Guitar
+    "BG_Near": 5, "BG_Behind": 5,
+    # Nível 4 — Keys + Vocal
+    "KV_Near": 4, "KV_Behind": 4,
+    # Nível 3 — Guitar + Vocal
+    "GV_Near": 3, "GV_Behind": 3,
+    # Nível 2 — Bass+Vocal duos, Guitar shots
+    "BV_Near": 2, "BV_Behind": 2,
+    "DG_Near": 2,
+    "G_Near": 2, "G_Behind": 2, "G_Head": 2, "G_Hand": 2,
+    # Nível 1 — Bass shots
+    "BD_Near": 1,
+    "B_Near": 1, "B_Behind": 1, "B_Head": 1, "B_Hand": 1,
+    # Nível 0 — Drums, Vocal, group shots (wide)
+    "DV_Near": 0,
+    "V_Near": 0, "V_Behind": 0, "V_Closeup": 0,
+    "D_Near": 0, "D_Behind": 0, "D_Head": 0, "D_Hand": 0,
+    "Front_Near": 0, "Front_Behind": 0,
+    "All_Near": 0, "All_Far": 0, "All_Behind": 0,
+}
+
 # Post-proc TONE bias by audio timbre (Section.warmth). The pp_study over the 20
 # official venues showed B&W/desaturated filters sit in DARK, quieter audio
 # (bright_p 39) while bright/contrast/filmic filters sit in BRIGHT, loud audio
@@ -1854,6 +1886,20 @@ def _guard_directed(cut: str, tick: int, tpb: int,
     return cut
 
 
+def _level_filter(candidates: list[str], min_level: int) -> list[str]:
+    """Filter cuts by Onyx level rule: level < min_level OR level == 0 if min == 0.
+    
+    Falls back to all candidates if filter would empty the pool.
+    """
+    if not candidates:
+        return candidates
+    if min_level == 0:
+        filtered = [c for c in candidates if _CAMERA_LEVELS.get(c, 999) == 0]
+    else:
+        filtered = [c for c in candidates if _CAMERA_LEVELS.get(c, 999) < min_level]
+    return filtered if filtered else candidates
+
+
 def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
                  tpb: int, bre_spans: list[tuple[int, int]] | None = None,
                  pace_scale: float = 1.0,
@@ -1918,6 +1964,7 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
     last_cut: str | None = None
     last_tick = -10 ** 9
     recent_coop: deque = deque(maxlen=6)
+    min_framing_level: int = 999  # Onyx level tracker: starts "infinite"
 
     # Lead-in: cut from tick 0 to the 1st section (officials never freeze on the intro).
     if sections and sections[0].start > tpb:
@@ -1933,12 +1980,16 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
                 placed = max(t, last_tick + min_gap)
             if placed >= s0.start:
                 break
-            cut = _markov_choice(last_cut, framing0, _CAMERA_MARKOV, framing0[0])
+            level_pool = _level_filter(framing0, min_framing_level)
+            cut = _markov_choice(last_cut, level_pool, _CAMERA_MARKOV, level_pool[0])
             if cut == last_cut:
                 idx += 1
-                cut = framing0[idx % len(framing0)]
+                cut = _markov_choice(last_cut, level_pool, _CAMERA_MARKOV, level_pool[idx % len(level_pool)])
             slots.append((placed, cut))
             last_cut, last_tick = cut, placed
+            cut_level = _CAMERA_LEVELS.get(cut, 999)
+            if cut_level < min_framing_level:
+                min_framing_level = cut_level
             idx += 1
             t += max(ms_to_ticks(pace_ms0, t, tempo_map, tpb), min_gap)
 
@@ -1971,19 +2022,26 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
             placed = _snap_to_music(t, accents, tpb, floor=last_tick + min_gap)
             if placed <= last_tick:
                 placed = max(t, last_tick + min_gap)
-            cut = _markov_choice(last_cut, pool, _CAMERA_MARKOV, pool[0])
-            if cut == last_cut:                      # avoid immediate repetition
+            # Onyx level filter: restrict pool to cuts that respect level progression
+            level_pool = _level_filter(pool, min_framing_level)
+            if not level_pool:
+                level_pool = pool
+            cut = _markov_choice(last_cut, level_pool, _CAMERA_MARKOV, level_pool[0])
+            if cut == last_cut:
                 idx += 1
-                cut = _markov_choice(last_cut, pool, _CAMERA_MARKOV, pool[idx % len(pool)])
-            # Anti-recency: skip a framing used in the recent window (wider variety).
-            for _ in range(len(pool)):
+                cut = _markov_choice(last_cut, level_pool, _CAMERA_MARKOV, level_pool[idx % len(level_pool)])
+            # Anti-recency
+            for _ in range(len(level_pool)):
                 if cut not in recent_coop and cut != last_cut:
                     break
                 idx += 1
-                cut = _markov_choice(last_cut, pool, _CAMERA_MARKOV, pool[idx % len(pool)])
+                cut = _markov_choice(last_cut, level_pool, _CAMERA_MARKOV, level_pool[idx % len(level_pool)])
             if placed < s.end:
                 slots.append((placed, cut))
                 recent_coop.append(cut)
+                cut_level = _CAMERA_LEVELS.get(cut, 999)
+                if cut_level < min_framing_level:
+                    min_framing_level = cut_level
                 last_cut, last_tick = cut, placed
             idx += 1
             t += step
