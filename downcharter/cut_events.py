@@ -39,7 +39,8 @@ class CutEvent:
 # rises/impact entries anchor structure; the rest are texture.
 PRIO = {
     "bre": 100, "stagedive": 90, "rise": 80, "solo": 70, "impact": 60,
-    "vocal_peak": 50, "duo": 45, "downtime": 40, "kick": 35, "technical": 30,
+    "vocal_hold": 55, "vocal_peak": 50, "duo": 45, "downtime": 40,
+    "drum_fill": 40, "kick": 35, "technical": 30,
 }
 
 _MELODIC = ("guitar", "bass", "keys")
@@ -318,54 +319,6 @@ def _busiest_onset(ons: list[int], start: int, end: int, tpb: int, prefer: int) 
     return best
 
 
-def detect_features(sections: list[Section], inst_onsets: dict[str, list[int]] | None,
-                    accents: list[int], tpb: int) -> list[CutEvent]:
-    """One FEATURE shot per mid/high section that FOLLOWS THE MUSIC: it films whoever
-    actually LEADS the section (song-relative density), as an interaction (duo) when two
-    members co-lead, otherwise a single-character close-up. The hit lands on a real onset
-    of the lead instrument. Candidates are ordered most→least specific so build_camera's
-    anti-recency still gives variety — but every option is grounded in what's playing,
-    instead of the old blind menu rotation that dropped vox/gtr close-ups on the wrong
-    instrument."""
-    out = []
-    if not inst_onsets:
-        return out
-    totals = {k: len(v) for k, v in inst_onsets.items()
-              if v and k in ("guitar", "bass", "keys", "drums", "vocal")}
-    real_vox = bool(inst_onsets.get("_vocal_real"))
-    for s in sections:
-        if _RANK[_camera_energy(s)] < 1:          # only mid/high
-            continue
-        mid = (s.start + s.end) // 2
-        leaders = _section_leaders(inst_onsets, s.start, s.end, totals)
-        if not leaders:
-            continue
-        lead, lead_score = leaders[0]
-        # Candidate order = most→least specific: co-lead duo, then lead close-up, then
-        # the second member's close-up. build_camera's anti-recency picks among these,
-        # so variety emerges while every option stays grounded in who's actually playing.
-        cuts: list[str] = []
-        # Co-lead duo: only when a second member is genuinely strong here (>=60% of the
-        # lead's density) and forms a real pair — that's a true interaction, not a guess.
-        second = None
-        if len(leaders) >= 2 and leaders[1][1] >= lead_score * 0.6:
-            second = leaders[1][0]
-            duo = _FEATURE_DUO.get(frozenset({lead, second}))
-            # Vocal duos need REAL vocals (lyrics) for the shot to read as interaction.
-            if duo and ("vocal" not in (lead, second) or real_vox):
-                cuts.append(duo)
-        cuts += _FEATURE_CLOSEUP.get(lead, [])
-        if second:
-            cuts += _FEATURE_CLOSEUP.get(second, [])
-        # Anchor where the LEAD is most active (busiest local onset), not the geometric
-        # midpoint — so the feature lands on the moment the player is actually going off,
-        # never in a mid-section lull.
-        lead_ons = inst_onsets.get(lead) or []
-        tick = _busiest_onset(lead_ons, s.start, s.end, tpb, mid) if lead_ons else mid
-        out.append(CutEvent(_nearest_accent(tick, accents, tpb), "feature", cuts,
-                            PRIO["duo"], note=f"feature {lead}@{s.kind}"))
-    return out
-
 
 def detect_stagedive(sections: list[Section], inst_onsets: dict[str, list[int]] | None,
                      accents: list[int], time_sig_map: list, tpb: int) -> list[CutEvent]:
@@ -405,6 +358,145 @@ def detect_technical(sections: list[Section], inst_onsets: dict[str, list[int]] 
     return out
 
 
+def detect_duos(sections: list[Section],
+                inst_onsets: dict[str, list[int]] | None,
+                accents: list[int], tpb: int) -> list[CutEvent]:
+    """Feature + DUO shot per section: film whoever LEADS the section.
+
+    Fires once per mid/high energy section. When two instruments strongly co-lead
+    (second ≥ 60% of lead's score), generates a DUO cut. With a single leader,
+    generates a close-up.
+
+    Official data: ~24% of cuts are duos.
+    """
+    out = []
+    if not inst_onsets:
+        return out
+    totals = {k: len(v) for k, v in inst_onsets.items()
+              if v and k in ("guitar", "bass", "keys", "drums", "vocal")}
+    real_vox = bool(inst_onsets.get("_vocal_real"))
+    for s in sections:
+        if _RANK[_camera_energy(s)] < 1:          # only mid/high
+            continue
+        if s.end - s.start < tpb * 4:
+            continue
+        leaders = _section_leaders(inst_onsets, s.start, s.end, totals)
+        if not leaders:
+            continue
+        lead, lead_score = leaders[0]
+        if lead_score < 0.02:
+            continue
+        mid = (s.start + s.end) // 2
+        # Try DUO: co-leaders with second ≥ 75% of lead (very strong co-lead only)
+        duo = None
+        if len(leaders) >= 2 and leaders[1][1] >= lead_score * 0.75:
+            second = leaders[1][0]
+            duo = _FEATURE_DUO.get(frozenset({lead, second}))
+            if duo and "vocal" in (lead, second) and not real_vox:
+                duo = None
+        if duo:
+            cuts = [duo]
+        else:
+            cuts = _FEATURE_CLOSEUP.get(lead, ["D_Vox_Cam_PT"])
+        lead_ons = inst_onsets.get(lead) or []
+        tick = (_busiest_onset(lead_ons, s.start, s.end, tpb, mid)
+                if lead_ons else mid)
+        tick = _nearest_accent(tick, accents, tpb)
+        out.append(CutEvent(tick, "duo", cuts, PRIO["duo"],
+                            note=f"duo/feature {lead}@{s.kind}"))
+    return out
+
+
+def detect_rhythm_accents(drum_onsets: list[int] | None,
+                          accents: list[int], tpb: int) -> list[CutEvent]:
+    """Drum fills and fast patterns → D_Drums_LT (2nd most common cut, 8.13%).
+
+    Detection: scan drum onsets for CLUSTERS of very fast hits (gaps ≤ 1/16 beat).
+    Only clusters with ≥ 8 hits in a ~2-beat window qualify as genuine fills.
+    """
+    out = []
+    if not drum_onsets or len(drum_onsets) < 8:
+        return out
+    drum = sorted(drum_onsets)
+    min_gap = max(1, tpb // 16)  # 1/16 note gap = very fast fill
+    # Find clusters of rapid hits
+    clusters: list[list[int]] = []
+    cur: list[int] = [drum[0]]
+    for i in range(1, len(drum)):
+        if drum[i] - drum[i - 1] <= min_gap:
+            cur.append(drum[i])
+        else:
+            if len(cur) >= 8:  # require fill of 8+ 1/16 hits
+                clusters.append(cur)
+            cur = [drum[i]]
+    if len(cur) >= 8:
+        clusters.append(cur)
+
+    last_tick = -10 ** 9
+    for cl in clusters:
+        # Busiest onset within cluster
+        best, best_cnt = cl[0], 0
+        for o in cl:
+            cnt = sum(1 for c in cl if abs(c - o) <= tpb)
+            if cnt > best_cnt:
+                best, best_cnt = o, cnt
+        tick = _nearest_accent(best, accents, tpb)
+        if tick - last_tick < tpb * 8:  # at most 1 per 8 beats
+            continue
+        out.append(CutEvent(tick, "drum_fill", ["D_Drums_LT", "D_Drums_Point", "D_Drums_KD"],
+                            PRIO["drum_fill"], note=f"drum fill ({len(cl)} hits)"))
+        last_tick = tick
+    return out
+
+
+def detect_vocal_hold(inst_onsets: dict[str, list[int]] | None,
+                      sections: list[Section],
+                      accents: list[int], time_sig_map: list,
+                      tpb: int) -> list[CutEvent]:
+    """Sustained vocal notes → directed_vocals_cam_pt (#1 cut, 10.3%).
+
+    Detection: in sections where vocal LEADS, find sustained notes (gap ≥ 4 beats
+    between vocal onsets). At most 1 per section, placed at the onset.
+    """
+    out = []
+    if not inst_onsets:
+        return out
+    vocal = inst_onsets.get("_vocal_real") or inst_onsets.get("vocal")
+    if not vocal or len(vocal) < 5:
+        return out
+    vocal = sorted(vocal)
+    totals = {k: len(v) for k, v in inst_onsets.items()
+              if v and k in ("guitar", "bass", "keys", "drums", "vocal")}
+    for s in sections:
+        if s.end - s.start < tpb * 4:
+            continue
+        # Only fire when vocal is the section leader
+        leaders = _section_leaders(inst_onsets, s.start, s.end, totals)
+        if not leaders or leaders[0][0] != "vocal":
+            continue
+        # Find the best sustained note (longest gap) in this section
+        import bisect
+        lo = bisect.bisect_left(vocal, s.start)
+        hi = bisect.bisect_left(vocal, s.end)
+        in_sec = vocal[lo:hi]
+        if len(in_sec) < 5:
+            continue
+        best_gap, best_tick = 0, 0
+        for i in range(len(in_sec) - 1):
+            gap = in_sec[i + 1] - in_sec[i]
+            if gap >= tpb * 6 and gap > best_gap:  # ≥ 6 beats sustain
+                best_gap = gap
+                best_tick = in_sec[i]
+        if best_gap == 0:
+            continue
+        tick = _nearest_accent(best_tick, accents, tpb)
+        out.append(CutEvent(tick, "vocal_hold",
+                            ["D_Vox_Cam_PT", "D_Vocals", "D_Vox_CLS"],
+                            PRIO["vocal_hold"],
+                            note=f"vocal hold ({best_gap // tpb:.0f}b)"))
+    return out
+
+
 def detect_events(sections: list[Section],
                   inst_onsets: dict[str, list[int]] | None,
                   accents: list[int] | None,
@@ -412,6 +504,7 @@ def detect_events(sections: list[Section],
                   time_sig_map: list, tpb: int) -> list[CutEvent]:
     """Full event timeline, sorted by tick (ties broken by priority desc)."""
     acc = sorted(accents) if accents else []
+    drum = sorted(inst_onsets.get("drums")) if inst_onsets and inst_onsets.get("drums") else None
     ev: list[CutEvent] = []
     ev += detect_bre(bre_spans)
     ev += detect_rises(sections, acc, tpb)
@@ -419,7 +512,9 @@ def detect_events(sections: list[Section],
     ev += detect_solos(sections, inst_onsets, acc, tpb)
     ev += detect_downtime(inst_onsets, time_sig_map, tpb)
     ev += detect_vocal_peaks(inst_onsets, acc, time_sig_map, tpb)
-    ev += detect_features(sections, inst_onsets, acc, tpb)
+    ev += detect_vocal_hold(inst_onsets, sections, acc, time_sig_map, tpb)
+    ev += detect_duos(sections, inst_onsets, acc, tpb)
+    ev += detect_rhythm_accents(drum, acc, tpb)
     ev += detect_stagedive(sections, inst_onsets, acc, time_sig_map, tpb)
     # detect_technical is defined but not wired yet (Phase 2+: precise fast-run anchor).
     ev.sort(key=lambda e: (e.tick, -e.priority))

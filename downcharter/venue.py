@@ -1974,7 +1974,9 @@ def build_camera(sections: list[Section], tempo_map: list, time_sig_map: list,
     if inst_onsets:
         baseline_events = detect_baseline_cuts(sections, inst_onsets, accents, time_sig_map, tpb)
         events += baseline_events
-        events.sort(key=lambda e: (e.tick, -e.priority))
+        events.sort(key=lambda e: (-e.priority, e.tick))
+    # Cap events at 40 highest-priority (official avg ~20, 2× margin)
+    events = events[:40]
     accepted: list[tuple[int, str]] = []
     last_fullband = -10 ** 9
     did_stagedive = False
