@@ -362,20 +362,22 @@ def normalize_source_midi(mid: mido.MidiFile) -> dict:
 # RB3 animates the drummer from dedicated animation notes (24-51 on PART DRUMS).
 # YARG auto-animates from the chart, but RB3 needs them authored, so a chart with
 # no animation notes leaves the drummer idle. We synthesise them from the Expert
-# Pro-drum gems with proper LEFT/RIGHT-HAND sticking — a faithful port of Onyx's
-# `autoDrumAnimation`/`autoSticking` (mtolly/onyx, Onyx/MIDI/Track/Drums.hs):
+# Pro-drum gems with proper LEFT/RIGHT-HAND sticking — a data-driven port of
+# Onyx's `autoDrumAnimation`/`autoSticking` (mtolly/onyx, Onyx/MIDI/Track/Drums.hs),
+# calibrated against 101 official Rock Band 3 drum charts:
 #
 #   * Each gem maps to an "anim pad" (snare, hihat, ride, crashes, toms), with
 #     pro-tom markers (110/111/112) turning the yellow/blue/green lanes into toms.
 #   * Simultaneous hits split between the hands (lower kit position → LH, higher
 #     → RH); special chords (two cymbals → both crashes; red+yellow-tom → snare
 #     flam) match Onyx.
-#   * Single hits within one eighth note (±1 beat at moderate tempos) form a
-#     "phrase" whose sticking alternates hands, using full-phrase lookahead to
-#     avoid crossovers. Velocity from the source MIDI is preserved: ghost notes
-#     (vel=1) use soft-hit animation variants; accents (vel=127) bias toward
-#     the dominant hand (RH).  Snare rolls force RLRL; hihat/toms/ride/crash
-#     stay consistent (scoring-driven) — matching real drumming technique.
+#   * Single hits within one eighth note form a "phrase". Per-pad default hands
+#     (data-derived from the official charts) replace crossover avoidance —
+#     crossovers are normal in real drumming: snare/crashes/ride default LH,
+#     hihat/floor/tom2 default RH.  Snare alternates (RLRL rolls); at groove
+#     speeds other pads stay on their default hand; dense fills (avg gap ≤ 16th
+#     note) alternate all pads.  Accents (vel ≥ 120) on snare/crash use RH.
+#     Ghost notes (vel=1) use soft-hit animation variants.
 #
 # The full RB3 animation note map (per Onyx `parseDrumAnimation`):
 #   24 kick(RF) · 26/28 snare hard/soft LH · 27/29 snare hard/soft RH ·
@@ -384,10 +386,20 @@ def normalize_source_midi(mid: mido.MidiFile) -> dict:
 #   46/47 tom1 LH/RH · 48/49 tom2 LH/RH · 50/51 floortom LH/RH
 _TOM_MARKERS = (110, 111, 112)
 
-# Anim pads, ordered left→right across the kit (used for hand assignment and the
-# "normal direction" of motion). Mirrors Onyx's `AnimPad` Ord.
+# Anim pads, ordered left→right across the kit. Mirrors Onyx's `AnimPad` Ord.
 _SNARE, _HIHAT, _CRASH1, _TOM1, _TOM2, _FLOOR, _CRASH2, _RIDE = range(8)
 _LH, _RH = "LH", "RH"
+
+# Per-pad default hand, derived from 101 official RB3 drum charts.
+_DEFAULT_HAND = {
+    _SNARE: _LH,
+    _HIHAT: _RH,
+    _CRASH1: _LH,
+    _CRASH2: _LH,
+    _RIDE: _LH,
+    _FLOOR: _RH,
+    _TOM2: _RH,
+}
 
 # (pad, hand, is_soft) → RB3 animation note. Soft variants (velocity = ghost)
 # exist for snare (28/29), crash1 (35/37), crash2 (39/45).  All other pads use
