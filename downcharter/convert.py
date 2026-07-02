@@ -374,7 +374,8 @@ def normalize_source_midi(mid: mido.MidiFile) -> dict:
 #     "phrase" whose sticking alternates hands, using full-phrase lookahead to
 #     avoid crossovers. Velocity from the source MIDI is preserved: ghost notes
 #     (vel=1) use soft-hit animation variants; accents (vel=127) bias toward
-#     the dominant hand (RH).
+#     the dominant hand (RH).  Snare rolls force RLRL; hihat/toms/ride/crash
+#     stay consistent (scoring-driven) — matching real drumming technique.
 #
 # The full RB3 animation note map (per Onyx `parseDrumAnimation`):
 #   24 kick(RF) · 26/28 snare hard/soft LH · 27/29 snare hard/soft RH ·
@@ -508,11 +509,11 @@ def _auto_sticking(phrase: list[tuple[int, int]]) -> list[str]:
                 # ---- same pad: scoring-based double-stroke decision ----
                 alt_hand = _flip(prev_hand)
 
-                # Roll detection: only snare and toms force RLRL (single-stroke
-                # rolls).  Hihat, ride and crashes are played with one consistent
-                # hand in real drumming — the scoring handles those naturally
-                # (prefers consistent hand for same-pad patterns).
-                _IS_ROLL_PAD = {_SNARE, _TOM1, _TOM2, _FLOOR}
+                # Roll detection: only snare forces RLRL (single-stroke rolls).
+                # Toms, hihat, ride and crashes are played with one consistent
+                # hand in real drumming — the scoring naturally prefers
+                # consistent hand for their same-pad patterns.
+                _IS_ROLL_PAD = {_SNARE}
                 same_remaining = len(rest) > 0 and all(p == x for p, _ in rest)
                 in_roll = (x in _IS_ROLL_PAD) and (
                     same_remaining or (i >= 2 and pads[i - 2] == x))
