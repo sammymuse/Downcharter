@@ -465,14 +465,16 @@ def _score_sticking(hands: list[str], pads: list[int]) -> int:
     return score
 
 
-def _auto_sticking(phrase: list[tuple[int, int]]) -> list[str]:
+def _auto_sticking(phrase: list[tuple[int, int]], is_dense: bool = False) -> list[str]:
     """Assign LH/RH to a phrase of single hits.
 
     Each element is (pad, velocity).  The algorithm uses full-phrase lookahead
     to choose the best starting hand and double-stroke placement, preferring
     the path with fewer crossovers.  Accents (vel 127) bias toward the
     dominant hand (RH) on snare/crash.
-    """
+
+    When *is_dense* is True (avg gap ≤ 16th note), all pads alternate during
+    rolls (fill detection).  At groove speeds, only snare forces RLRL."""
     pads = [p for p, _ in phrase]
     vels = [v for _, v in phrase]
     n = len(phrase)
@@ -509,14 +511,12 @@ def _auto_sticking(phrase: list[tuple[int, int]]) -> list[str]:
                 # ---- same pad: scoring-based double-stroke decision ----
                 alt_hand = _flip(prev_hand)
 
-                # Roll detection: only snare forces RLRL (single-stroke rolls).
-                # Toms, hihat, ride and crashes are played with one consistent
-                # hand in real drumming — the scoring naturally prefers
-                # consistent hand for their same-pad patterns.
+                # Roll detection: snare always alternates (single-stroke rolls).
+                # Other pads alternate only in dense fills (avg gap ≤ 16th note).
                 _IS_ROLL_PAD = {_SNARE}
                 same_remaining = len(rest) > 0 and all(p == x for p, _ in rest)
-                in_roll = (x in _IS_ROLL_PAD) and (
-                    same_remaining or (i >= 2 and pads[i - 2] == x))
+                in_roll = ((x in _IS_ROLL_PAD or is_dense) and (
+                    same_remaining or (i >= 2 and pads[i - 2] == x)))
                 if in_roll:
                     hand = alt_hand
                 else:
@@ -536,9 +536,9 @@ def _auto_sticking(phrase: list[tuple[int, int]]) -> list[str]:
                                          and alt_hand == _RH) else 0
 
                     # Tiebreaker: prefer alternating when the scores are equal.
-                    # Only for roll pads (snare/toms) — non-roll pads (hihat,
-                    # ride, crash) stay consistent with the dominant hand.
-                    tiebreak_alt = (x in _IS_ROLL_PAD
+                    # Only for roll pads or dense fills — non-roll pads at
+                    # groove speeds stay consistent with the dominant hand.
+                    tiebreak_alt = ((x in _IS_ROLL_PAD or is_dense)
                                     and score_double == score_alt
                                     and not accent_bias
                                     and ((len(rest) <= 1 and len(out) < 2)
@@ -681,7 +681,16 @@ def generate_drum_animations(mid: mido.MidiFile) -> tuple[mido.MidiFile, dict]:
             if not buffer:
                 return
             phrase = [(p, v) for _, p, v in buffer]
-            hands = _auto_sticking(phrase)
+            # Detect dense fills: if the average gap within the phrase is
+            # ≤ a 16th note (tpb//4), it's a roll — even toms alternate.
+            phrase_ticks = [t for t, _, _ in buffer]
+            if len(phrase_ticks) >= 3:
+                gaps = [phrase_ticks[i+1] - phrase_ticks[i]
+                        for i in range(len(phrase_ticks)-1)]
+                is_dense = sum(gaps) / len(gaps) <= tpb // 4
+            else:
+                is_dense = False
+            hands = _auto_sticking(phrase, is_dense=is_dense)
             for (btick, pad, vel), hand in zip(buffer, hands):
                 _emit(btick, pad, hand, vel)
             buffer.clear()
