@@ -372,12 +372,13 @@ def normalize_source_midi(mid: mido.MidiFile) -> dict:
 #     → RH); special chords (two cymbals → both crashes; red+yellow-tom → snare
 #     flam) match Onyx.
 #   * Single hits within one eighth note form a "phrase". Per-pad default hands
-#     (data-derived from the official charts) replace crossover avoidance —
-#     crossovers are normal in real drumming: snare/crashes/ride default LH,
-#     hihat/floor/tom2 default RH.  Snare alternates (RLRL rolls); at groove
-#     speeds other pads stay on their default hand; dense fills (avg gap ≤ 16th
-#     note) alternate all pads.  Accents (vel ≥ 120) on snare/crash use RH.
-#     Ghost notes (vel=1) use soft-hit animation variants.
+#     (data-derived from 101 official RB3 charts) drive the primary assignment:
+#     only snare is LH-dominant (83.6%); all other pads default to RH.
+#     Snare alternates (RLRL rolls); at groove speeds other pads stay on their
+#     default hand; dense fills (avg gap ≤ 16th note) alternate all pads.
+#     Anti-crossover from _normal_direction acts as a secondary correction
+#     for pads with moderate confidence (< 90 %).  Accents (vel ≥ 120) on
+#     snare/crash use RH.  Ghost notes (vel=1) use soft-hit animation variants.
 #
 # The full RB3 animation note map (per Onyx `parseDrumAnimation`):
 #   24 kick(RF) · 26/28 snare hard/soft LH · 27/29 snare hard/soft RH ·
@@ -391,12 +392,14 @@ _SNARE, _HIHAT, _CRASH1, _TOM1, _TOM2, _FLOOR, _CRASH2, _RIDE = range(8)
 _LH, _RH = "LH", "RH"
 
 # Per-pad default hand, derived from 101 official RB3 drum charts.
+# Right-side pads (ride, crash2, floor) are RH; left-side hihat is
+# crossed-grip RH; only snare is LH (RH busy on hihat).
 _DEFAULT_HAND = {
     _SNARE: _LH,
     _HIHAT: _RH,
-    _CRASH1: _LH,
-    _CRASH2: _LH,
-    _RIDE: _LH,
+    _CRASH1: _RH,
+    _CRASH2: _RH,
+    _RIDE: _RH,
     _FLOOR: _RH,
     _TOM2: _RH,
 }
@@ -419,12 +422,12 @@ _ANIM_NOTE = {
 }
 # Confidence of each default hand (%, derived from 101 official RB3 charts).
 # Used by anti-crossover: pads with ≥ 90 % confidence keep their default
-# regardless of natural direction; moderate-confidence pads may flip.
+# regardless of natural direction; lower-confidence pads may flip.
 _DEFAULT_CONFIDENCE = {
     _SNARE: 84,
     _HIHAT: 88,
-    _CRASH1: 81,
-    _CRASH2: 100,
+    _CRASH1: 70,
+    _CRASH2: 99,
     _RIDE: 97,
     _FLOOR: 93,
     _TOM2: 67,

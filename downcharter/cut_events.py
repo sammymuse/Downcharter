@@ -371,24 +371,21 @@ def detect_stagedive(sections: list[Section], inst_onsets: dict[str, list[int]] 
 _VOX_SKIP_KINDS = frozenset({"solo", "riff", "intro"})
 
 # Section-kind → entry cut type, data-driven from 100 songs (2997 cuts).
-# D_Vox_Cam_PT is first for all vocal-capable kinds. The guard rejects it
-# when vocals aren't playing nearby, falling to the generic ALL/Duo/Drums
-# candidate. This prevents the dominant confusion VOX→ALL where a chorus
-# entry would skip VOX because the 4-beat window missed the vocal onset.
-# (Official data: VOX is 25.7% of first events — the single strongest signal.)
+# Used as base/fallback; VOX is prepended at runtime when vocals are present
+# (official data: VOX is 25.7% of first events — the single strongest signal).
 _SECTION_ENTRY_CUTS: dict[str, list[str]] = {
-    "verse":      ["D_Vox_Cam_PT", "D_Vocals"],
-    "prechorus":  ["D_Vox_Cam_PT", "D_Drums_LT"],
-    "chorus":     ["D_Vox_Cam_PT", "D_All", "D_All_Cam"],
-    "solo":       ["D_Gtr_Cam_PT", "D_Gtr_CLS"],      # instrument section
-    "build":      ["D_Vox_Cam_PT", "D_Crowd_Gtr"],
-    "breakdown":  ["D_Vox_Cam_PT", "D_All"],
-    "drop":       ["D_All_LT", "D_All_Cam"],
-    "outro":      ["D_Vocals", "D_All_Cam"],
-    "intro":      ["D_Drums_LT", "D_Gtr_CLS"],         # instrumental intro
-    "bridge":     ["D_Duo_GB", "D_Drums_LT"],
-    "postchorus": ["D_Vox_Cam_PT", "D_All_Yeah", "D_All_Cam"],
-    "riff":       ["D_Bass", "D_Gtr"],                  # instrumental riff
+    "verse":      ["D_Vox_Cam_PT", "D_Vocals"],       # Vox_PT 3.2%, Vocals 2.1%
+    "prechorus":  ["D_Vox_Cam_PT", "D_Drums_LT"],     # Vox_PT 4.6%, Drums_LT 2.3%
+    "chorus":     ["D_All", "D_All_Cam"],              # All 5.5%, All_Cam 3.7%
+    "solo":       ["D_Gtr_Cam_PT", "D_Gtr_CLS"],      # Gtr_PT 6.2%, Gtr_CLS 3.4%
+    "build":      ["D_Crowd_Gtr", "D_Vox_Cam_PT"],    # Crowd 6.7%, Vox_PT 4.4%
+    "breakdown":  ["D_All", "D_Vox_Cam_PT"],           # All 3.2%, Vox_PT 2.4%
+    "drop":       ["D_All_LT", "D_All_Cam"],           # (rare, data sparse)
+    "outro":      ["D_Vocals", "D_All_Cam"],           # Vocals 3.4%, All_Cam 3.4%
+    "intro":      ["D_Drums_LT", "D_Gtr_CLS"],         # Drums_LT 6.8%, Gtr_CLS 5.2%
+    "bridge":     ["D_Duo_GB", "D_Drums_LT"],          # Duo_GB 4.8%, Drums_LT 3.2%
+    "postchorus": ["D_All_Yeah", "D_All_Cam"],         # All_Yeah 4.1%, All_Cam 2.7%
+    "riff":       ["D_Bass", "D_Gtr"],                 # Bass 6.0%, Gtr 3.7%
     "default":    ["D_Vox_Cam_PT"],
 }
 
